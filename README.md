@@ -4,7 +4,7 @@ Pod-local WireGuard networking with Kubernetes endpoint discovery. Runs in a
 Pod's network namespace, as a standalone container or beside another gateway.
 No CNI changes, node routes, CRDs, or central controller are required.
 
-**Initial implementation; not production-validated.**
+See the [three-node test report and measured recovery times](docs/dev-acceptance-2026-11-02.md).
 
 ## Scope
 
@@ -235,6 +235,7 @@ these examples.
 ```sh
 go test -race -count=1 ./...
 go vet ./...
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 docker build -t wg-link:test .
 WG_LINK_IMAGE=wg-link:test bash tests/integration.sh
 docker pull python:3.14-alpine@sha256:eb2c62658b8d51bff0acc408504b76521d02030de56a8a3c1e830083e89b89d2
@@ -247,6 +248,29 @@ network with kernel WireGuard and `NET_ADMIN` (`NET_RAW` only for test pings).
 It checks bidirectional traffic, live key/peer reload and retained blackhole
 routes after route removal. It does not change host routes or use host networking.
 Throwaway test keys stay outside the checkout and are removed during cleanup.
-Informer tests use a fake Kubernetes client; they do not replace cross-node
-Kubernetes acceptance tests. CI runs formatting, vet, race tests, the container
-integration test and multiarchitecture image builds.
+The three-gateway forwarding integration adds source-preserving ICMP/TCP/UDP,
+steady-state address checks, allowed/denied ports and destinations, kernel nft
+counters, and live ACL revocation/restoration of a held TCP connection without
+reconnecting. Informer tests use a fake Kubernetes client; they do not replace
+cross-node acceptance. CI runs measurement unit tests, formatting, vet, race
+tests, both container integrations and multiarchitecture image builds.
+
+### Isolated Kubernetes acceptance
+
+The [Kubernetes acceptance test](tests/kubernetes_acceptance.py) runs in dev
+on three nodes. It requires immutable application/probe image digests and
+explicit `--execute`. It creates a unique
+ownership-labelled namespace and removes it on success or failure. It never
+drains, reboots, reprovisions or changes scheduling settings of shared nodes.
+
+The topology is client → two-interface router → target on three initial nodes.
+It validates allowed/denied ICMP/TCP/UDP, original source IP, live ACL changes,
+router relocation, Pod recreation, scale-to-zero recovery, and Service recreation
+with a changed ClusterIP. The images are prewarmed on all three nodes.
+
+Continuous ICMP probes use a 200 ms interval and 600 ms timeout. Results distinguish
+the observed successful-reply gap from change-marker → fifth successful probe
+after EndpointSlice/kernel-endpoint convergence. The latter includes Kubernetes
+command, scheduling and startup time. The test moves gateway Pods between
+running nodes.
+Complete latency evidence and successful cleanup are required for a passing run.

@@ -515,7 +515,9 @@ class Harness:
             self.progress('cleanup: collect sanitized evidence and delete only owned namespace '+self.ns)
             self.stop.set()
             if self.watcher:self.watcher.join(timeout=240)
-            if self.watcher and self.watcher.is_alive():self.result['observer_error']='observer failed to stop within bounded API timeouts'
+            if self.watcher and self.watcher.is_alive():
+                self.result['observer_error']='observer failed to stop within bounded API timeouts'
+                self.result['passed']=False
             if self.created:
                 try:
                     events=self.ping_events(); self.result['probe_events']=events
@@ -574,6 +576,13 @@ class Harness:
                               'prechange_to_confirmed_recovery_seconds':(confirmed['mono_ns']-t)/1e9 if confirmed else None,
                               'failed_probes':sum(not e['ok'] for e in post),'sample_interval_seconds':.2,'icmp_timeout_seconds':.6})
         self.result['recovery']=summaries
+        if self.result.get('passed'):
+            expected={'move-cp2-to-cp3','delete-router-pod','scale-zero-one','service-new-cluster-ip'}
+            assert expected.issubset({s['name'] for s in summaries}), 'incomplete latency scenario evidence'
+            assert all(s['confirmed_fifth_success_ns'] is not None and
+                       s['prechange_to_confirmed_recovery_seconds'] is not None and
+                       s['maximum_observed_success_gap_seconds'] is not None for s in summaries), 'missing recovery measurement'
+            self.result['latency_evidence_complete']=True
 
 
 def main():
