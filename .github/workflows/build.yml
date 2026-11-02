@@ -35,6 +35,7 @@ jobs:
           load: true
           platforms: linux/amd64
           tags: wg-link:test
+          labels: org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: WireGuard network integration
@@ -51,6 +52,25 @@ jobs:
           text = re.sub(r'[A-Za-z0-9+/]{43}=', '[REDACTED-KEY]', text)
           text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
           print('::error title=WireGuard integration failure::' + text)
+          PY
+          fi
+          exit "$status"
+      - name: WireGuard forwarding integration
+        shell: bash
+        run: |
+          probe_image=python:3.14-alpine@sha256:eb2c62658b8d51bff0acc408504b76521d02030de56a8a3c1e830083e89b89d2
+          docker pull "$probe_image"
+          set +e
+          python3 tests/forwarding_integration.py --execute --probe-image "$probe_image" 2>&1 | tee /tmp/wg-link-forwarding.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if (( status != 0 )); then
+            python3 - <<'PY'
+          import pathlib, re
+          text = pathlib.Path('/tmp/wg-link-forwarding.log').read_text()[-6000:]
+          text = re.sub(r'[A-Za-z0-9+/]{43}=', '[REDACTED-KEY]', text)
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Forwarding integration failure::' + text)
           PY
           fi
           exit "$status"
@@ -110,6 +130,9 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: ${{ steps.image.outputs.publish == 'true' }}
           tags: ${{ steps.image.outputs.name }}:${{ steps.image.outputs.tag }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.image.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max

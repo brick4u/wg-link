@@ -3,6 +3,7 @@ package wglink
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"sort"
 
 	"github.com/vishvananda/netlink"
@@ -136,6 +137,53 @@ func ensureRoute(r netlink.Route) error {
 	}
 	return netlink.RouteReplace(&r)
 }
+
+// Address identity excludes kernel-populated label, flags, scope and lifetimes.
+// Comparing Addr.String() is unsafe: AddrList appends the interface label, so a
+// matching address from the pre-AddrReplace snapshot could be deleted afterward.
+// Keep host bits (these are interface addresses), address family and peer prefix.
+type addressIdentity struct{ Local, Peer netip.Prefix }
+
+func identityOfAddress(a netlink.Addr) (addressIdentity, bool) {
+	prefix := func(n *net.IPNet) (netip.Prefix, bool) {
+		if n == nil {
+			return netip.Prefix{}, false
+		}
+		ip, ok := netip.AddrFromSlice(n.IP)
+		if !ok {
+			return netip.Prefix{}, false
+		}
+		bits, size := n.Mask.Size()
+		if size == 0 {
+			return netip.Prefix{}, false
+		}
+		if ip.Is4In6() && size == 128 {
+			if bits < 96 {
+				return netip.Prefix{}, false
+			}
+			bits -= 96
+		}
+		ip = ip.Unmap()
+		if bits > ip.BitLen() {
+			return netip.Prefix{}, false
+		}
+		return netip.PrefixFrom(ip, bits), true
+	}
+	local, ok := prefix(a.IPNet)
+	if !ok {
+		return addressIdentity{}, false
+	}
+	id := addressIdentity{Local: local}
+	if a.Peer != nil {
+		peer, valid := prefix(a.Peer)
+		if !valid {
+			return addressIdentity{}, false
+		}
+		id.Peer = peer
+	}
+	return id, true
+}
+
 func (b *LinuxBackend) Apply(desired []DesiredInterface) error {
 	// Install persistent guards before touching peers or interfaces. Tombstones intentionally survive config removal.
 	for _, d := range desired {
@@ -199,13 +247,17 @@ func (b *LinuxBackend) Apply(desired []DesiredInterface) error {
 		if e != nil {
 			return e
 		}
-		wantedAddr := map[string]bool{}
+		wantedAddr := map[addressIdentity]bool{}
 		for _, a := range n.Addresses {
 			addr, e := netlink.ParseAddr(a)
 			if e != nil {
 				return e
 			}
-			wantedAddr[addr.String()] = true
+			id, ok := identityOfAddress(*addr)
+			if !ok {
+				return fmt.Errorf("invalid interface address identity")
+			}
+			wantedAddr[id] = true
 			if e = netlink.AddrReplace(l, addr); e != nil {
 				return e
 			}
@@ -214,7 +266,8 @@ func (b *LinuxBackend) Apply(desired []DesiredInterface) error {
 			if a.IP.IsLinkLocalUnicast() {
 				continue
 			}
-			if !wantedAddr[a.String()] {
+			id, ok := identityOfAddress(a)
+			if !ok || !wantedAddr[id] {
 				if e = netlink.AddrDel(l, &a); e != nil {
 					return e
 				}

@@ -6,7 +6,8 @@ ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
+COPY *.go ./
+COPY cmd/ ./cmd/
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/wg-link ./cmd/wg-link
 
 FROM alpine:3.24.3
