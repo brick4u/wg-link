@@ -1,0 +1,131 @@
+# Plain Kubernetes example. Pin an immutable image tag/digest before production use.
+# Create ConfigMap wg-link-config and Secret wg-link-keys as described in README.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wg-link
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wg-link
+  namespace: wg-link
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wg-link-discovery
+  namespace: wg-link
+rules:
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wg-link-discovery
+  namespace: wg-link
+subjects:
+  - kind: ServiceAccount
+    name: wg-link
+    namespace: wg-link
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wg-link-discovery
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wg-link
+  namespace: wg-link
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: wg-link
+  template:
+    metadata:
+      labels:
+        app: wg-link
+    spec:
+      serviceAccountName: wg-link
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: wg-link
+          image: ghcr.io/brick4u/wg-link:master
+          args: ["-config", "/etc/wg-link/config.yaml", "-listen", ":9090"]
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [NET_ADMIN]
+          ports:
+            - name: wireguard
+              containerPort: 51820
+              protocol: UDP
+            - name: access
+              containerPort: 51821
+              protocol: UDP
+            - name: http
+              containerPort: 9090
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/wg-link
+              readOnly: true
+            - name: keys
+              mountPath: /etc/wg-link/keys
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: wg-link-config
+        - name: keys
+          secret:
+            secretName: wg-link-keys
+            defaultMode: 0400
+---
+# Other wg-link instances can discover this instance through this Service.
+# Deploy a separate, reciprocal peer-gateway Service and workload for the
+# service reference in config.yaml; this manifest does not create that peer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wg-link
+  namespace: wg-link
+spec:
+  selector:
+    app: wg-link
+  ports:
+    - name: wireguard
+      port: 51820
+      targetPort: wireguard
+      protocol: UDP
+    - name: access
+      port: 51821
+      targetPort: access
+      protocol: UDP

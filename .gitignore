@@ -1,0 +1,5 @@
+/bin/
+/wg-link
+/coverage.out
+/coverage.html
+*.test
