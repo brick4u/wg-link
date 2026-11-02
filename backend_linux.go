@@ -128,7 +128,7 @@ func ensureRoute(r netlink.Route) error {
 			if e != nil {
 				return e
 			}
-			if l.Type() == "wireguard" && l.Attrs().Alias == ownerAlias {
+			if l.Type() == "wireguard" && l.Attrs().Alias == ownerAlias && (r.Type == unix.RTN_BLACKHOLE || existing.LinkIndex == r.LinkIndex) {
 				continue
 			}
 		}

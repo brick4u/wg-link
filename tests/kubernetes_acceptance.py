@@ -49,6 +49,45 @@ def ping(dst,seq,continuous=True):
                 if typ==0 and pid==ident and n==seq&65535: ok=True; break
     record({'kind':'ping','seq':seq,'target':dst,'continuous':continuous,'ok':ok,'started_ns':int(t*1e9),'duration':time.monotonic()-t})
     return ok
+def tcp_client(c,a,port):
+    with c:
+        c.settimeout(1); pending=b''; end=time.monotonic()+600
+        while time.monotonic()<end:
+            try: data=c.recv(4096)
+            except socket.timeout: continue
+            except OSError: break
+            if not data: break
+            pending+=data
+            while b'\n' in pending:
+                line,pending=pending.split(b'\n',1)
+                try: c.sendall(json.dumps({'source':a[0],'payload':line.decode()}).encode()+b'\n')
+                except OSError: return
+                record({'kind':'received','protocol':'tcp','port':port,'source':a[0],'payload':line.decode()})
+def held_tcp():
+    while not os.path.exists('/tmp/held-start'): time.sleep(.1)
+    with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as s:
+        s.settimeout(1); s.bind((os.environ['SOURCE'],0))
+        try: s.connect((os.environ['TARGET'],18080))
+        except OSError as e: record({'kind':'held_connect','ok':False,'error':str(e)}); return
+        identity={'local':s.getsockname(),'peer':s.getpeername()}
+        record({'kind':'held_connect','ok':True,**identity})
+        seq=0; pending=b''; end=time.monotonic()+600
+        while time.monotonic()<end and not os.path.exists('/tmp/held-stop'):
+            seq+=1; ok=False; started=time.monotonic_ns()
+            try:
+                s.sendall(('held:'+str(seq)+'\n').encode())
+                data=s.recv(4096)
+                if not data: raise ConnectionError('held TCP peer closed')
+                pending+=data
+                while b'\n' in pending:
+                    line,pending=pending.split(b'\n',1); echo=json.loads(line)
+                    record({'kind':'held_echo','echo':echo,**identity});ok=True
+            except socket.timeout: pass
+            except OSError as e:
+                record({'kind':'held_fatal','error':str(e),**identity});return
+            record({'kind':'held_attempt','seq':seq,'started_ns':started,'ok':ok,**identity})
+            time.sleep(.2)
+        record({'kind':'held_stopped',**identity})
 def echo(proto,port):
     s=socket.socket(socket.AF_INET,socket.SOCK_STREAM if proto=='tcp' else socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('0.0.0.0',port))
@@ -57,10 +96,8 @@ def echo(proto,port):
     while True:
         if proto=='tcp':
             c,a=s.accept()
-            with c:
-                c.settimeout(2)
-                try: data=c.recv(1024); c.sendall(json.dumps({'source':a[0],'payload':data.decode()}).encode())
-                except OSError: pass
+            threading.Thread(target=tcp_client,args=(c,a,port),daemon=True).start()
+            continue
         else:
             data,ancillary,flags,a=s.recvmsg(1024,socket.CMSG_SPACE(12))
             pktinfo=[(level,typ,value) for level,typ,value in ancillary if level==socket.SOL_IP and typ==getattr(socket,'IP_PKTINFO',8)]
@@ -71,7 +108,14 @@ def check(dst,port,proto):
     s=socket.socket(socket.AF_INET,socket.SOCK_STREAM if proto=='tcp' else socket.SOCK_DGRAM)
     s.settimeout(2); s.bind((os.environ['SOURCE'],0))
     try:
-        s.connect((dst,int(port))); s.send(b'acceptance'); result=json.loads(s.recv(1024)); result['ok']=True
+        s.connect((dst,int(port))); s.sendall(b'acceptance\n' if proto=='tcp' else b'acceptance')
+        data=s.recv(1024)
+        if proto=='tcp':
+            while b'\n' not in data:
+                chunk=s.recv(1024)
+                if not chunk: raise ConnectionError('echo closed before newline')
+                data+=chunk
+        result=json.loads(data); result['ok']=True
     except OSError: result={'ok':False}
     finally: s.close()
     print(json.dumps(result))
@@ -83,6 +127,7 @@ if len(sys.argv)>1:
 for proto in ('tcp','udp'):
     for port in (18080,18081): threading.Thread(target=echo,args=(proto,port),daemon=True).start()
 if os.environ.get('TARGET'):
+    threading.Thread(target=held_tcp,daemon=True).start()
     pool=concurrent.futures.ThreadPoolExecutor(max_workers=8)
     seq=0; deadline=time.monotonic()
     while True:
@@ -105,7 +150,7 @@ class Harness:
                        'events': [], 'checks': [], 'untested': ['node failure/drain/reboot', 'IPv6',
                        'production workloads', 'performance/MTU stress', 'external APN integration'],
                        'clock_note': 'Controller and probe monotonic clocks are separate. Gap calculations use probe clock only.',
-                       'latency_note': 'ICMP samples every 0.2s with 0.6s timeout. maximum_observed_success_gap_seconds is the actual observed receive gap, not exact packet-loss duration. prechange_to_confirmed_recovery_seconds includes API command, pod startup and EndpointSlice/kernel peer convergence plus five successful probes; prewarming excludes pulls when cached images remain available.'}
+                       'latency_note': 'ICMP samples every 0.2s with 0.6s timeout. maximum_observed_success_gap_seconds is the actual observed receive gap, not exact packet-loss duration. prechange_to_confirmed_recovery_seconds runs from the :before mark to the FIFTH successful probe after convergence and includes API command, pod startup and EndpointSlice/kernel peer convergence; prewarming excludes pulls when cached images remain available.'}
         self.created = False
         self.stop = threading.Event()
         self.watcher = None
@@ -197,6 +242,7 @@ class Harness:
                 if ports:r['ports']=ports
                 rules.append(r)
         configs['router']['forwarding']={'enabled':True,'rules':rules}
+        self.configs=configs
         objects=[self.resource('ServiceAccount','wg-link'),self.resource('ConfigMap','probe',data={'probe.py':PROBE})]
         objects += [dict(apiVersion='rbac.authorization.k8s.io/v1',kind='Role',metadata={'name':'discovery','namespace':self.ns},rules=[{'apiGroups':[''],'resources':['services'],'verbs':['get','list','watch']},{'apiGroups':['discovery.k8s.io'],'resources':['endpointslices'],'verbs':['get','list','watch']}]),
                     dict(apiVersion='rbac.authorization.k8s.io/v1',kind='RoleBinding',metadata={'name':'discovery','namespace':self.ns},subjects=[{'kind':'ServiceAccount','name':'wg-link','namespace':self.ns}],roleRef={'apiGroup':'rbac.authorization.k8s.io','kind':'Role','name':'discovery'})]
@@ -222,18 +268,22 @@ class Harness:
             objects.append(dict(apiVersion='apps/v1',kind='Deployment',metadata={'name':role,'namespace':self.ns},spec={'replicas':1,'strategy':{'type':'Recreate'},'selector':{'matchLabels':{'app':role}},'template':{'metadata':{'labels':{'app':role}},'spec':spec}}))
         self.apply(objects)
 
-    def checks(self, phase):
+    def progress(self, message):
+        print(time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())+' '+message,flush=True)
+
+    def checks(self, phase, allowed=True):
+        self.progress(phase+': checking bidirectional ICMP/TCP/UDP and negative controls')
         for role,dst,source in [('a','198.18.30.1','198.18.10.2'),('c','198.18.10.2','198.18.30.1')]:
             icmp=json.loads(self.execute(role,'probe','python','/probe/probe.py','ping',dst))
             self.result['checks'].append(dict(phase=phase,role=role,protocol='icmp',result=icmp))
-            assert icmp['ok'], 'ICMP failed '+role
+            assert icmp['ok']==allowed, 'unexpected ICMP result '+role
             # Confirm denied-port servers really listen; a closed port is not an ACL test.
             local=json.loads(self.execute(role,'probe','python','/probe/probe.py','check',source,'18081','tcp'))
             assert local['ok'], 'negative-control TCP echo listener unavailable'
             local=json.loads(self.execute(role,'probe','python','/probe/probe.py','check',source,'18081','udp'))
             assert local['ok'], 'negative-control UDP echo listener unavailable'
             for protocol in ('tcp','udp'):
-                for port,expected in [(18080,True),(18081,False)]:
+                for port,expected in [(18080,allowed),(18081,False)]:
                     value=json.loads(self.execute(role,'probe','python','/probe/probe.py','check',dst,str(port),protocol))
                     self.result['checks'].append(dict(phase=phase,role=role,protocol=protocol,port=port,result=value))
                     assert value['ok']==expected, str((role,protocol,port,value))
@@ -250,11 +300,87 @@ class Harness:
         text=self.execute('a','probe','python','-c',"print(open('/tmp/events.jsonl').read())")
         return [json.loads(line) for line in text.splitlines() if line]
 
-    def sustained(self, after=0):
+    def sustained(self, after=0, expected=True):
         def check():
             p=[e for e in self.ping_events() if e['kind']=='ping' and e.get('continuous',True) and e['started_ns']>after]
-            return len(p)>=5 and all(e['ok'] for e in sorted(p,key=lambda e:e['started_ns'])[-5:])
-        self.wait(check,'five sustained successful ICMP probes')
+            return len(p)>=5 and all(e['ok']==expected for e in sorted(p,key=lambda e:e['started_ns'])[-5:])
+        self.wait(check,'five sustained '+('successful' if expected else 'blocked')+' ICMP probes')
+
+    def forwarding_snapshot(self):
+        value=json.loads(self.execute('router','wg-link','nft','-j','list','table','inet','wg_link'))
+        items=value.get('nftables',[])
+        assert any(x.get('table',{}).get('comment')=='wg-link:v1' and x['table'].get('family')=='inet' and x['table'].get('name')=='wg_link' for x in items), 'owned nft table absent'
+        rules=[x['rule'] for x in items if x.get('rule',{}).get('table')=='wg_link' and x['rule'].get('chain')=='forward']
+        accepts=[r for r in rules if any('accept' in e for e in r.get('expr',[]))]
+        drops=[r for r in rules if any('drop' in e for e in r.get('expr',[]))]
+        # Both ingress and egress owned-interface guards must survive revocation.
+        scoped_drops=[r for r in drops if 'owned_interfaces' in json.dumps(r)]
+        assert len(scoped_drops)>=2, 'scoped owned-interface drop guards missing'
+        return value,len(accepts)
+
+    def acl_revocation(self):
+        self.progress('acl-revocation: live ConfigMap deny/restore; no router restart')
+        original=self.pod('router')
+        identity=(original['metadata']['uid'],[(c['name'],c.get('restartCount',0)) for c in original['status']['containerStatuses']])
+        saved=json.loads(json.dumps(self.configs['router']))
+        denied=json.loads(json.dumps(saved));denied['forwarding']['rules']=[]
+        self.execute('a','probe','python','-c',"open('/tmp/held-start','w').close()")
+        def held_ready():
+            events=self.ping_events()
+            assert not any(e['kind']=='held_fatal' for e in events), 'held TCP failed before revocation'
+            return len([e for e in events if e['kind']=='held_echo'])>=3
+        self.wait(held_ready,'held TCP established and echoing without reconnect')
+        connection=next(e for e in self.ping_events() if e['kind']=='held_connect' and e['ok'])
+        self.mark('acl-revocation:before')
+        def update(config):
+            start=time.monotonic_ns()
+            self.apply([self.resource('ConfigMap','router',data={'config.yaml':json.dumps(config)})])
+            self.result['events'].append({'kind':'acl_configmap_update','deny':not bool(config['forwarding']['rules']),'controller_start_ns':start,'controller_end_ns':time.monotonic_ns()})
+        def kernel(expected_accept):
+            value,count=self.forwarding_snapshot()
+            if (count>0)!=expected_accept:return False
+            return value
+        try:
+            update(denied)
+            self.progress('acl-revocation: waiting for projected ConfigMap and kernel accept-rule removal (up to timeout)')
+            snapshot=self.wait(lambda:kernel(False),'live nft ACL revocation')
+            (self.out/'acl-revoked-nft.json').write_text(self.redact(json.dumps(snapshot,indent=2)))
+            # Drain any echo already delivered before the nft transaction before
+            # opening the denial observation window on the A process clock.
+            time.sleep(1)
+            self.mark('acl-revocation:denied')
+            stamp=next(e['mono_ns'] for e in reversed(self.ping_events()) if e.get('name')=='acl-revocation:denied')
+            self.sustained(stamp,expected=False)
+            self.checks('acl-revoked',allowed=False)
+            held_denied=[e for e in self.ping_events() if e['mono_ns']>stamp and e['kind'].startswith('held_')]
+            assert not any(e['kind'] in ('held_echo','held_fatal','held_connect') for e in held_denied), 'held TCP echoed, failed fatally or reconnected during revoked ACL'
+            assert len([e for e in held_denied if e['kind']=='held_attempt' and not e['ok']])>=3, 'held TCP denial interval lacks failed request evidence'
+            self.result['held_tcp_denial']={'connection':connection,'events':held_denied,'no_reconnect':True}
+            self.progress('acl-revocation: held TCP and new traffic blocked; restoring original ACL')
+        finally:
+            # Restore even when an assertion fails, without touching other resources.
+            update(saved)
+        snapshot=self.wait(lambda:kernel(True),'live nft ACL restoration')
+        (self.out/'acl-restored-nft.json').write_text(self.redact(json.dumps(snapshot,indent=2)))
+        self.mark('acl-revocation:returned')
+        stamp=next(e['mono_ns'] for e in reversed(self.ping_events()) if e.get('name')=='acl-revocation:returned')
+        self.sustained(stamp)
+        def held_restored():
+            events=self.ping_events()
+            connects=[e for e in events if e['kind']=='held_connect']
+            assert len(connects)==1 and connects[0]['ok'], 'held TCP reconnected'
+            assert not any(e['kind']=='held_fatal' for e in events), 'held TCP failed fatally'
+            echoes=[e for e in events if e['kind']=='held_echo' and e['mono_ns']>stamp]
+            assert all(e['local']==connection['local'] and e['peer']==connection['peer'] for e in echoes), 'held TCP socket tuple changed'
+            return len(echoes)>=3
+        self.wait(held_restored,'original held TCP session resumes after ACL restore')
+        self.execute('a','probe','python','-c',"open('/tmp/held-stop','w').close()")
+        self.mark('acl-revocation:recovered')
+        self.checks('acl-restored')
+        current=self.pod('router')
+        assert identity==(current['metadata']['uid'],[(c['name'],c.get('restartCount',0)) for c in current['status']['containerStatuses']]), 'router restarted during live ACL update'
+        self.result['acl_revocation']={'passed':True,'router_restarted':False,'established_tcp_revocation_tested':True,'same_tcp_session_restored':True,'continuous_icmp':True,'new_connections_both_directions':['tcp','udp']}
+        self.progress('acl-revocation: PASS (new traffic denied; original established TCP blocked and restored without reconnect)')
 
     def observe(self):
         while not self.stop.is_set():
@@ -273,6 +399,7 @@ class Harness:
             self.stop.wait(.5)
 
     def mutation(self,name,fn):
+        self.progress(name+': starting isolated workload/service mutation (not a node failure test)')
         self.sustained()
         self.mark(name+':before')
         start=time.monotonic_ns()
@@ -285,6 +412,7 @@ class Harness:
         self.sustained(marks[-1]['mono_ns'])
         self.mark(name+':recovered')
         self.checks(name)
+        self.progress(name+': PASS')
 
     def discovery_converged(self):
         router=self.pod('router')
@@ -335,6 +463,7 @@ class Harness:
 
     def prewarm(self):
         for node in ('cp1','cp2','cp3'):
+            self.progress('prewarm: '+node+' application and probe images')
             self.apply([self.resource('Pod','prewarm-'+node,spec={'nodeSelector':{'kubernetes.io/hostname':node},'tolerations':[{'operator':'Exists','effect':'NoSchedule'}], 'restartPolicy':'Never','containers':[
                 {'name':'agent','image':self.a.image,'command':['/bin/sh','-c','sleep 600']},
                 {'name':'probe','image':self.a.probe_image,'command':['python','-c','import time; time.sleep(600)']} ]})])
@@ -342,16 +471,20 @@ class Harness:
         self.k('delete','pods','-n',self.ns,'prewarm-cp1','prewarm-cp2','prewarm-cp3','--wait=true',timeout=self.a.timeout)
 
     def main(self):
+        self.progress('preflight: verify cp1/cp2/cp3 Ready using explicit brick-dev kubeconfig')
         before=self.ready_nodes(); self.result['nodes_before']=before
         try:
             # Create, never adopt/relabel an existing namespace.
             self.k('create','-f','-',data=json.dumps({'apiVersion':'v1','kind':'Namespace','metadata':{'name':self.ns,'labels':{'wg-link-acceptance-owner':self.token,'pod-security.kubernetes.io/enforce':'privileged','pod-security.kubernetes.io/audit':'privileged','pod-security.kubernetes.io/warn':'privileged'}}}))
             self.created=True
             if not self.a.skip_prewarm:self.prewarm()
+            self.progress('topology: creating isolated A cp1 / router cp2 / C cp3 workloads')
             self.topology()
             for role in ('a','router','c'):self.wait(lambda:self.pod(role),role+' startup')
             self.watcher=threading.Thread(target=self.observe); self.watcher.start()
             self.sustained(); self.checks('baseline'); self.diagnostics('baseline')
+            self.progress('baseline: PASS')
+            self.acl_revocation()
             self.mutation('move-cp2-to-cp3',lambda:self.k('patch','deployment/router','-n',self.ns,'--type=merge','-p',json.dumps({'spec':{'template':{'spec':{'nodeSelector':{'kubernetes.io/hostname':'cp3'}}}}})))
             assert self.pod('router')['spec']['nodeName']=='cp3'
             self.mutation('delete-router-pod',lambda:self.k('delete','pod',self.pod('router')['metadata']['name'],'-n',self.ns,'--wait=true'))
@@ -379,6 +512,7 @@ class Harness:
                 except Exception as diagnostic_error:self.result['diagnostics_error']=self.redact(str(diagnostic_error))
             raise
         finally:
+            self.progress('cleanup: collect sanitized evidence and delete only owned namespace '+self.ns)
             self.stop.set()
             if self.watcher:self.watcher.join(timeout=240)
             if self.watcher and self.watcher.is_alive():self.result['observer_error']='observer failed to stop within bounded API timeouts'
@@ -415,9 +549,10 @@ class Harness:
             post=[e for e in p if e['started_ns']>t and e['mono_ns']<=end]
             threshold=marks.get(prefix+':returned',t)
             converged=[e for e in post if e['started_ns']>threshold]
-            first=None
+            first=None;confirmed=None
             for i in range(len(converged)-4):
-                if all(e['ok'] for e in converged[i:i+5]):first=converged[i];break
+                if all(e['ok'] for e in converged[i:i+5]):
+                    first=converged[i];confirmed=converged[i+4];break
             last=prior[-1] if prior else None
             successes=sorted(([last] if last else [])+[e for e in post if e['ok']],key=lambda e:e['mono_ns'])
             maxgap=max(((b['mono_ns']-a['mono_ns'])/1e9 for a,b in zip(successes,successes[1:])),default=None)
@@ -435,7 +570,8 @@ class Harness:
                               'first_sustained_success_after_loss_ns':data_recovery['mono_ns'] if data_recovery else None,
                               'last_before_loss_to_sustained_recovery_seconds':(data_recovery['mono_ns']-last_before_loss['mono_ns'])/1e9 if data_recovery and last_before_loss else None,
                               'maximum_observed_success_gap_seconds':maxgap,
-                              'prechange_to_confirmed_recovery_seconds':(first['mono_ns']-last['mono_ns'])/1e9 if first and last else None,
+                              'confirmed_fifth_success_ns':confirmed['mono_ns'] if confirmed else None,
+                              'prechange_to_confirmed_recovery_seconds':(confirmed['mono_ns']-t)/1e9 if confirmed else None,
                               'failed_probes':sum(not e['ok'] for e in post),'sample_interval_seconds':.2,'icmp_timeout_seconds':.6})
         self.result['recovery']=summaries
 

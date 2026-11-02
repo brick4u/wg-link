@@ -3,3 +3,5 @@ _internal_docs
 bin
 coverage*
 *.test
+__pycache__
+wg-link

@@ -27,6 +27,52 @@ func TestForwardingFailureStopsBackend(t *testing.T) {
 	}
 }
 
+type stagedForwardingBackend struct {
+	fakeBackend
+	state forwardingState
+}
+
+func (b *stagedForwardingBackend) ApplyForwarding(c *Config) error { return b.state.apply(c) }
+func (b *stagedForwardingBackend) CommitForwarding(*Config) error  { return b.state.commit() }
+func TestForwardingTwoPhaseFailures(t *testing.T) {
+	for _, mixed := range []bool{true, false} {
+		t.Run(map[bool]string{true: "mixed-family-sysctl", false: "backend-failure"}[mixed], func(t *testing.T) {
+			b := &stagedForwardingBackend{}
+			batches := []string{}
+			b.state.run = func(_ context.Context, input string, args ...string) ([]byte, error) {
+				if input != "" {
+					batches = append(batches, input)
+					return nil, nil
+				}
+				return []byte(`{"nftables":[]}`), nil
+			}
+			b.state.readFile = func(path string) ([]byte, error) {
+				if strings.Contains(path, "ipv6") {
+					return []byte("0"), nil
+				}
+				return []byte("1"), nil
+			}
+			b.state.writeFile = func(string, []byte, os.FileMode) error { return errors.New("read-only") }
+			c := forwardingConfig()
+			if mixed {
+				c.Forwarding.Rules = append(c.Forwarding.Rules, ForwardRule{From: "wg-a", To: "wg-b", Source: "2001:db8::/64", Destination: "2001:db8:1::/64", Protocols: []string{"tcp"}})
+			} else {
+				b.err = errors.New("route failure")
+			}
+			a := &Agent{Backend: b}
+			if a.Reconcile(c) == nil {
+				t.Fatal("expected failure")
+			}
+			if len(batches) != 1 || strings.Contains(batches[0], "ct state") {
+				t.Fatalf("new allows installed on failure: %v", batches)
+			}
+			if mixed && b.state.pending != "" {
+				t.Fatal("sysctl failure left committable ACL")
+			}
+		})
+	}
+}
+
 func forwardingConfig() *Config {
 	return &Config{Interfaces: []Interface{{Name: "wg-a"}, {Name: "wg-b"}}, Forwarding: &Forwarding{Enabled: true, Rules: []ForwardRule{{From: "wg-a", To: "wg-b", Source: "10.0.0.0/24", Destination: "10.1.0.0/24", Protocols: []string{"tcp"}, Ports: []int{443}}}}}
 }
@@ -139,18 +185,35 @@ func TestForwardingUnchangedAndDisable(t *testing.T) {
 		if err := s.apply(c); err != nil {
 			t.Fatal(err)
 		}
+		if err := s.commit(); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if len(batches) != 1 || writes != 0 {
+	if len(batches) != 2 || writes != 0 {
 		t.Fatalf("batches=%d writes=%d", len(batches), writes)
+	}
+	// A route-only change must stage denial even when the ACL is identical.
+	c.Interfaces[0].Routes = []string{"192.0.2.0/24"}
+	if err := s.apply(c); err != nil {
+		t.Fatal(err)
+	}
+	if len(batches) != 3 || strings.Contains(batches[2], "ct state") {
+		t.Fatal("route-only change did not stage denial")
+	}
+	if err := s.commit(); err != nil {
+		t.Fatal(err)
+	}
+	if len(batches) != 4 || !strings.Contains(batches[3], "ct state") {
+		t.Fatal("commit did not restore explicit allows")
 	}
 	c.Forwarding = nil
 	if err := s.apply(c); err != nil {
 		t.Fatal(err)
 	}
-	if len(batches) != 2 || strings.Contains(batches[1], "ct state") {
+	if len(batches) != 5 || strings.Contains(batches[4], "ct state") {
 		t.Fatal(batches)
 	}
-	if !strings.Contains(batches[1], "drop") {
+	if !strings.Contains(batches[4], "drop") {
 		t.Fatal("lost deny boundary")
 	}
 }

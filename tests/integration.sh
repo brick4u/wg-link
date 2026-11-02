@@ -80,14 +80,12 @@ mkdir "$tmp/a" "$tmp/b" "$tmp/keys"
 chmod 0755 "$tmp/a" "$tmp/b"
 docker network create --driver bridge --internal --label "$label=$token" "$network" >/dev/null
 subnet=$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$network")
-read -r ip_a ip_b < <(python3 - "$subnet" <<'PY'
+python3 - "$subnet" <<'PY'
 import ipaddress, sys
 net = ipaddress.ip_network(sys.argv[1])
 assert net.version == 4 and net.num_addresses > 4
 assert not net.overlaps(ipaddress.ip_network('198.18.0.0/15'))
-print(net.network_address + 2, net.network_address + 3)
 PY
-)
 # No key ever appears in command arguments or console output.
 for key in a b rotated; do
     docker run --rm --name "$token-key" --label "$label=$token" --network none --entrypoint wg "$image" genkey >"$tmp/keys/$key"
@@ -115,16 +113,27 @@ staged.chmod(0o644)
 os.replace(staged, path)
 PY
 }
-config a b.pub
-config b a.pub
+# Let Docker allocate addresses. Some daemon versions forbid --ip on networks
+# allocated from default pools. Test-only launcher waits for the generated config.
 for side in a b; do
-    if [[ $side == a ]]; then name=$a; ip=$ip_a; else name=$b; ip=$ip_b; fi
+    if [[ $side == a ]]; then name=$a; else name=$b; fi
     docker run -d --name "$name" --label "$label=$token" \
-        --network "$network" --ip "$ip" --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW \
+        --network "$network" --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW \
         --read-only --security-opt no-new-privileges \
         --mount "type=bind,src=$tmp/$side,dst=/etc/wg-link,readonly" \
-        "$image" -config /etc/wg-link/config.yaml >/dev/null
+        --entrypoint sh "$image" -c '
+            for attempt in $(seq 1 300); do
+                if [ -r /etc/wg-link/config.yaml ]; then
+                    exec /usr/local/bin/wg-link -config /etc/wg-link/config.yaml
+                fi
+                sleep 0.1
+            done
+            exit 1' >/dev/null
 done
+ip_a=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$a")
+ip_b=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$b")
+config a b.pub
+config b a.pub
 # Bounded readiness/convergence retry; no unbounded sleep or busy polling.
 await() {
     local attempt

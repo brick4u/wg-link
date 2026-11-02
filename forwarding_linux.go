@@ -3,6 +3,7 @@ package wglink
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/netip"
@@ -20,10 +21,13 @@ const nftOwner = "wg-link:v1"
 
 type nftRunner func(context.Context, string, ...string) ([]byte, error)
 type forwardingState struct {
-	run       nftRunner
-	readFile  func(string) ([]byte, error)
-	writeFile func(string, []byte, os.FileMode) error
-	last      string
+	run             nftRunner
+	readFile        func(string) ([]byte, error)
+	writeFile       func(string, []byte, os.FileMode) error
+	last            string // Last successfully installed batch, including deny-only staging.
+	pending         string // Final ACL, eligible for commit only after sysctl validation.
+	committedConfig [32]byte
+	pendingConfig   [32]byte
 }
 
 func runNFT(ctx context.Context, input string, args ...string) ([]byte, error) {
@@ -60,7 +64,26 @@ func (b *LinuxBackend) ApplyForwarding(c *Config) error {
 	}
 	return b.forwarding.apply(c)
 }
+func (b *LinuxBackend) CommitForwarding(*Config) error { return b.forwarding.commit() }
+
+func (s *forwardingState) commit() error {
+	if s.pending == "" {
+		s.committedConfig = s.pendingConfig
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := s.run(ctx, "delete table inet wg_link\n"+s.pending, "-f", "-"); err != nil {
+		return err
+	}
+	s.last = s.pending
+	s.committedConfig = s.pendingConfig
+	s.pending = ""
+	return nil
+}
+
 func (s *forwardingState) apply(c *Config) error {
+	s.pending = ""
 	if err := validateForwarding(c); err != nil {
 		return err
 	}
@@ -139,15 +162,34 @@ func (s *forwardingState) apply(c *Config) error {
 		names[n.Name] = true
 	}
 	batch := renderForwarding(c, names)
-	if !exists || batch != s.last {
-		input := batch
-		if exists {
-			input = "delete table inet wg_link\n" + input
+	// Include routes, peer declarations and loaded key material, not just ACLs:
+	// a route/key-only reload must also stay denied until backend success.
+	encoded, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	for _, n := range c.Interfaces {
+		encoded = append(encoded, n.key[:]...)
+		for _, p := range n.Peers {
+			encoded = append(encoded, p.psk[:]...)
 		}
-		if _, err = s.run(ctx, input, "-f", "-"); err != nil {
-			return err
+	}
+	fingerprint := sha256.Sum256(encoded)
+	changed := !exists || batch != s.last || fingerprint != s.committedConfig
+	if changed {
+		denyConfig := *c
+		denyConfig.Forwarding = nil
+		boundary := renderForwarding(&denyConfig, names)
+		if !exists || boundary != s.last {
+			input := boundary
+			if exists {
+				input = "delete table inet wg_link\n" + input
+			}
+			if _, err = s.run(ctx, input, "-f", "-"); err != nil {
+				return err
+			}
+			s.last = boundary
 		}
-		s.last = batch
 	}
 	if enabled {
 		families := map[bool]bool{}
@@ -181,6 +223,10 @@ func (s *forwardingState) apply(c *Config) error {
 			}
 		}
 	}
+	if batch != s.last {
+		s.pending = batch
+	}
+	s.pendingConfig = fingerprint
 	return nil
 }
 func renderForwarding(c *Config, names map[string]bool) string {

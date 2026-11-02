@@ -133,6 +133,13 @@ The agent owns only nftables table `inet wg_link`, identified by table comment
 without that ownership comment is a conflict, not something the agent overwrites.
 Do not share the table or its ownership marker with other processes.
 
+Changed configurations first stage a deny-only boundary, validate required
+forwarding sysctls and reconcile interfaces, peers and routes. Only then are the
+final allows committed. A failed reconciliation remains denied; a successful
+reload can briefly interrupt forwarding. Unchanged configurations do not churn
+the ruleset. Address-generated routes that would shadow another interface's
+explicit routes are rejected before network changes.
+
 Once enabled, disabling or omitting `forwarding` removes the allows but retains
 a **deny-only boundary**, including historical interface names, across reloads
 and agent restarts in the same network namespace. Forwarding sysctls remain

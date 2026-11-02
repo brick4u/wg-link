@@ -31,6 +31,11 @@ type Agent struct {
 func (a *Agent) Reconcile(c *Config) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if err := validateRouting(c); err != nil {
+		a.failures++
+		a.ready = false
+		return err
+	}
 	if f, ok := a.Backend.(interface{ ApplyForwarding(*Config) error }); ok {
 		if err := f.ApplyForwarding(c); err != nil {
 			a.failures++
@@ -95,6 +100,13 @@ func (a *Agent) Reconcile(c *Config) error {
 		a.ready = false
 		a.failures++
 		return prepareErr
+	}
+	if f, ok := a.Backend.(interface{ CommitForwarding(*Config) error }); ok {
+		if err := f.CommitForwarding(c); err != nil {
+			a.failures++
+			a.ready = false
+			return err
+		}
 	}
 	a.ready = true
 	a.successes++

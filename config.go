@@ -136,6 +136,9 @@ func Load(path string) (*Config, error) {
 			}
 		}
 	}
+	if err := validateRouting(&c); err != nil {
+		return nil, err
+	}
 	if err := validateForwarding(&c); err != nil {
 		return nil, err
 	}
