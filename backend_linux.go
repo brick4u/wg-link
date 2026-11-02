@@ -28,6 +28,7 @@ type Backend interface {
 	Devices() ([]*wgtypes.Device, error)
 }
 type LinuxBackend struct {
+	forwarding       forwardingState
 	wg               *wgctrl.Client
 	appliedEndpoints map[string]map[wgtypes.Key]string
 }

@@ -27,3 +27,22 @@ interfaces:
       - publicKey: MOBILE_PUBLIC_KEY_PLACEHOLDER
         allowedIPs: [198.51.100.2/32]
         # No endpoint or service: learn the endpoint from authenticated traffic.
+
+# Optional: only this access peer may initiate HTTPS to the transit subnet.
+# Both interfaces must be declared above and owned by this container.
+# Configure reciprocal peer AllowedIPs/routes and return routes separately.
+forwarding:
+  enabled: true
+  rules:
+    - from: wg-access
+      to: wg-transit
+      source: 198.51.100.2/32
+      destination: 203.0.113.0/25
+      protocols: [tcp]
+      ports: [443] # Integer destination ports; omitted/empty means all TCP/UDP ports.
+# Exact reverse ESTABLISHED replies are allowed; other owned-interface forwarding
+# is dropped. No broad RELATED allowance (related ICMP is denied).
+# Requires net.ipv4.ip_forward=1; preconfigure via permitted Pod sysctls if needed.
+# After first enablement, disabling/omitting retains a deny-only boundary and
+# historical interface names; it does not reset sysctls. Recreate the Pod network
+# namespace or arrange deliberate operator cleanup to remove that boundary.

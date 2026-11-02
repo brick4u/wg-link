@@ -27,9 +27,9 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go test -race -count=1 ./...
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: Build integration image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           load: true
@@ -38,7 +38,22 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: WireGuard network integration
-        run: bash tests/integration.sh
+        shell: bash
+        run: |
+          set +e
+          bash tests/integration.sh 2>&1 | tee /tmp/wg-link-integration.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if (( status != 0 )); then
+            python3 - <<'PY'
+          import pathlib, re
+          text = pathlib.Path('/tmp/wg-link-integration.log').read_text()[-6000:]
+          text = re.sub(r'[A-Za-z0-9+/]{43}=', '[REDACTED-KEY]', text)
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=WireGuard integration failure::' + text)
+          PY
+          fi
+          exit "$status"
 
   image:
     if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/master' || github.ref_type == 'tag')
@@ -73,23 +88,23 @@ jobs:
           echo "registry=${image%%/*}" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: Login to GHCR
         if: steps.image.outputs.publish == 'true' && steps.image.outputs.registry == 'ghcr.io'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Login to external registry
         if: steps.image.outputs.publish == 'true' && steps.image.outputs.registry != 'ghcr.io'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
           registry: ${{ steps.image.outputs.registry }}
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64

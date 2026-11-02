@@ -14,10 +14,11 @@ No CNI changes, node routes, CRDs, or central controller are required.
 - Polling reload of configuration and key files, including Kubernetes projected
   volume updates (polled every second). Mount whole directories, **not `subPath`**. Key rotation can
   interrupt sessions and requires coordination with peers.
-- **No general firewall, forwarding, NAT, IPAM, or key-generation management.**
-  A support router needs separately supplied IP forwarding, explicit forwarding
-  ACLs, return routes, and any required NAT. Creating two interfaces does not
-  create a secure router. NetworkPolicy does not replace inner-tunnel ACLs.
+- Optional, explicit forwarding ACLs between WireGuard interfaces managed by the
+  same container. Creating two interfaces alone does not enable forwarding.
+- **No NAT, provider-specific routing, general firewall, IPAM, or key-generation
+  management.** Supply return routes and any required external NAT separately.
+  NetworkPolicy does not replace inner-tunnel ACLs.
 
 Requires Linux kernel WireGuard support already available on the node, reachable
 UDP endpoints, and `NET_ADMIN` in the Pod network namespace. No `hostNetwork`,
@@ -39,7 +40,10 @@ go build -o wg-link ./cmd/wg-link
 | `-kubeconfig` | unset | Explicit kubeconfig; otherwise in-cluster credentials for discovery |
 | `-check` | false | Validate configuration and key files, then exit; no API access or `NET_ADMIN` needed |
 
-The container uses Go 1.27.3 and Alpine 3.24.3. The GitHub Actions workflow
+The container uses Go 1.27.3 and Alpine 3.24.3 and includes `nftables`.
+The `nft` executable is required even when forwarding configuration is omitted:
+reconciliation discovers any previously owned forwarding boundary.
+The GitHub Actions workflow
 publishes `ghcr.io/brick4u/wg-link` by default using the repository `GITHUB_TOKEN`:
 
 | Git ref | Image tag |
@@ -89,6 +93,59 @@ including the first Service-backed peer. Watched namespace scope accumulates
 until the agent restarts, even when references are removed from configuration.
 Discovery is not HA: there is no WireGuard session, IPSec, NAT, or conntrack
 state synchronization.
+
+### Optional forwarding
+
+Set `forwarding.enabled: true` and declare explicit `rules` to forward traffic
+between WireGuard interfaces managed by this container. The example permits
+only TCP destination port 443 from one access peer to a transit subnet.
+Forwarding does not add routes or change WireGuard `allowedIPs`; configure both
+and the remote return routes separately.
+
+Each rule requires:
+
+| Field | Meaning |
+| --- | --- |
+| `from`, `to` | Ingress and egress interfaces declared in `interfaces`; only owned WireGuard links are supported |
+| `source`, `destination` | Canonical network CIDRs of the same address family; these select IPv4 or IPv6 |
+| `protocols` | Nonempty list of `icmp` (IPv4), `icmpv6` (IPv6), `tcp`, or `udp`; no duplicates |
+| `ports` | Optional unique integer destination ports, 1–65535; allowed only with TCP/UDP protocols |
+
+Omitting `ports` or using `ports: []` permits **all destination ports** for the
+listed TCP/UDP protocols. Use separate rules for ICMP and port-limited TCP/UDP.
+An enabled configuration with no rules denies all forwarded traffic involving
+owned interfaces. A disabled configuration must not contain rules.
+
+Each allow rule admits matching new/established traffic and exact per-rule
+reverse `ESTABLISHED` replies: reversed interfaces and CIDRs, the same protocol,
+and source ports matching the original destination ports when restricted.
+There is no global established-state bypass. Removing an ACL also revokes its
+existing connections unless another current rule permits them. There is **no
+broad `RELATED` allowance**; related ICMP errors are conservatively denied.
+
+The scoped default is drop for any forwarded packet entering or leaving an
+owned interface unless explicitly allowed. Unrelated forwarding is unchanged;
+other firewall tables can still deny permitted traffic. These ACLs do not manage
+traffic to/from the container itself or provide a general firewall.
+
+The agent owns only nftables table `inet wg_link`, identified by table comment
+`wg-link:v1`, and replaces its rules in one atomic `nft` batch. A same-named table
+without that ownership comment is a conflict, not something the agent overwrites.
+Do not share the table or its ownership marker with other processes.
+
+Once enabled, disabling or omitting `forwarding` removes the allows but retains
+a **deny-only boundary**, including historical interface names, across reloads
+and agent restarts in the same network namespace. Forwarding sysctls remain
+unchanged. Clean removal requires Pod/network-namespace recreation or deliberate
+operator cleanup after reviewing leak risk; stopping the agent is not cleanup.
+
+Only families used by enabled rules require forwarding sysctls:
+`net.ipv4.ip_forward=1` and/or `net.ipv6.conf.all.forwarding=1`. If already `1`,
+the agent skips writing. Otherwise it attempts to enable the required family;
+a read-only `/proc/sys` causes reconciliation to fail. Preconfigure the values
+through permitted Pod `securityContext.sysctls` (subject to cluster admission)
+or another approved preconfiguration mechanism. `NET_ADMIN` cannot bypass a
+read-only proc filesystem; do not use a privileged-container workaround.
 
 ## Kubernetes example
 

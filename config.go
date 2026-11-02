@@ -17,6 +17,7 @@ import (
 
 type Config struct {
 	Interfaces []Interface `yaml:"interfaces"`
+	Forwarding *Forwarding `yaml:"forwarding"`
 }
 type Interface struct {
 	Name           string   `yaml:"name"`
@@ -134,6 +135,9 @@ func Load(path string) (*Config, error) {
 				}
 			}
 		}
+	}
+	if err := validateForwarding(&c); err != nil {
+		return nil, err
 	}
 	return &c, nil
 }

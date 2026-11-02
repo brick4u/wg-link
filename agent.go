@@ -31,6 +31,17 @@ type Agent struct {
 func (a *Agent) Reconcile(c *Config) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if f, ok := a.Backend.(interface{ ApplyForwarding(*Config) error }); ok {
+		if err := f.ApplyForwarding(c); err != nil {
+			a.failures++
+			a.ready = false
+			return err
+		}
+	} else if c.Forwarding != nil && c.Forwarding.Enabled {
+		a.failures++
+		a.ready = false
+		return fmt.Errorf("backend does not support forwarding")
+	}
 	var prepareErr error
 	if a.Prepare != nil {
 		prepareErr = a.Prepare(c)
