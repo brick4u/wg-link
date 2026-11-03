@@ -4,7 +4,8 @@ Pod-local WireGuard networking with Kubernetes endpoint discovery. Runs in a
 Pod's network namespace, as a standalone container or beside another gateway.
 No CNI changes, node routes, CRDs, or central controller are required.
 
-See the [three-node test report and measured recovery times](docs/dev-acceptance-2026-11-02.md).
+See the [three-node test report and measured recovery times](docs/dev-acceptance-2026-11-02.md)
+and the [integrated IPSec, DNS, NAT and monitoring test](docs/system-acceptance-2026-11-03.md).
 
 ## Scope
 
@@ -119,6 +120,9 @@ An enabled configuration with no rules denies all forwarded traffic involving
 scoped interfaces. A disabled configuration must not contain rules or masquerade entries.
 
 #### External interfaces and IPv4 masquerading
+
+These fields were added on `master` after `1.0.0`. The
+[integrated test report](docs/system-acceptance-2026-11-03.md) records the tested image digest.
 
 `externalInterfaces` is an optional list of existing namespace-local interface
 names, for example `[eth0]`. Names must be valid, unique, and distinct from

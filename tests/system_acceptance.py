@@ -11,8 +11,8 @@ support client -> support -> gateway -> APN. A sixth Pod is a mock Internet sink
 Provider/gateway use standard image entrypoints and swanctl load-all. The strongSwan
 image must load /etc/strongswan.conf, start charon as PID 1, provide swanctl, and
 read /etc/swanctl/swanctl.conf. Exporter flags follow torilabs v1.10.2.
-Unbound uses explicit static policy answers: recursion/DNSSEC/public Internet are
-not acceptance claims. No SLA or production/APN interoperability claim is made.
+Exercises static Unbound policy answers, IPv4 routing, health conditions and
+component recovery with a simulated APN peer and a mock Internet endpoint.
 
 Run --help for parameters. Without --execute only validates arguments. This file
 can be imported for offline manifest inspection; importing has no side effects.
@@ -40,13 +40,14 @@ _spec = importlib.util.spec_from_file_location('wg_accept_probe', Path(__file__)
 _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
 PROBE = r'''
-import http.server,threading,json
+import http.server,threading,json,sys
 class EchoHTTP(http.server.BaseHTTPRequestHandler):
  def do_GET(self):
   b=json.dumps({'source':self.client_address[0],'path':self.path}).encode()
   self.send_response(200);self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)
  def log_message(self,*args):pass
-threading.Thread(target=http.server.ThreadingHTTPServer(('0.0.0.0',18082),EchoHTTP).serve_forever,daemon=True).start()
+if len(sys.argv)==1:
+ threading.Thread(target=http.server.ThreadingHTTPServer(('0.0.0.0',18082),EchoHTTP).serve_forever,daemon=True).start()
 ''' + _module.PROBE
 DNS_PROBE = r'''
 import json,socket,struct,sys,random
@@ -94,8 +95,8 @@ class Harness:
         os.chmod(self.out, 0o700)
         self.result = {'schema': 1, 'checks': [], 'images': {k: getattr(args, k) for k in
                        ('wg_image', 'strongswan_image', 'unbound_image', 'exporter_image', 'probe_image')},
-                       'limitations': ['static DNS policy, not recursive DNSSEC validation',
-                                       'mock APN and Internet only', 'no failover SLA', 'IPv4 only']}
+                       'scope': {'ip_family': 'IPv4', 'dns': 'static policy answers',
+                                       'peer': 'simulated APN', 'egress': 'mock Internet endpoint'}}
 
     def redact(self, text):
         for item in self.sensitive:
@@ -108,6 +109,11 @@ class Harness:
         p = subprocess.run(argv, input=data, capture_output=True, text=True, timeout=timeout)
         if p.returncode and not allow:
             raise RuntimeError('subprocess failed: ' + self.redact(p.stderr[-3000:]))
+        if allow:
+            # Best-effort diagnostics retain stderr and exit status, including
+            # successful kubectl exec warnings; never mistake CLI errors for emptiness.
+            return p.stdout+('\n[stderr]\n'+p.stderr if p.stderr else '')+(
+                '\n[exit code: '+str(p.returncode)+']\n' if p.returncode else '')
         return p.stdout
 
     def k(self, *args, data=None, timeout=45, allow=False):
@@ -140,7 +146,11 @@ class Harness:
     def exec(self, role, container, *cmd, allow=False):
         return self.k('exec', '-n', self.ns, role, '-c', container, '--', *cmd, allow=allow)
 
+    def progress(self, message):
+        print(time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())+' '+message,flush=True)
+
     def check(self, name, fn):
+        self.progress('check: '+name)
         start = time.monotonic()
         value = fn()
         assert value is not False, name
@@ -279,7 +289,11 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
             # Preserve image defaults, including charon start-scripts load-all,
             # stderr logging, plugin loading and the standard /run VICI socket.
             objects.append(self.resource('Secret', role+'-ipsec', stringData={'swanctl.conf': sw}))
-            objects.append(self.service('ipsec-gateway' if role=='gateway' else 'provider-peer', role, [('ike',500),('natt',4500)]))
+            ike_service=self.service('ipsec-gateway' if role=='gateway' else 'provider-peer', role, [('ike',500),('natt',4500)])
+            # Only outer IKE bootstrap bypasses datapath readiness. WireGuard
+            # discovery retains normal ready EndpointSlice selection.
+            if role=='gateway':ike_service['spec']['publishNotReadyAddresses']=True
+            objects.append(ike_service)
         unbound = '''server:
  interface: 0.0.0.0
  interface-automatic: yes
@@ -318,7 +332,9 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
             if role in ('gateway','provider'):
                 volumes += [{'name':'run','emptyDir':{}}, {'name':'ipsec','secret':{'secretName':role+'-ipsec'}}]
                 containers.append(self.container('strongswan',self.a.strongswan_image,['NET_ADMIN','NET_RAW','NET_BIND_SERVICE'],
-                    readinessProbe={'exec':{'command':['swanctl','--stats']},'periodSeconds':3},
+                    readinessProbe=({'exec':{'command':['ping','-n','-I','198.18.51.1','-c','1','-W','1',APN]},
+                                     'periodSeconds':3,'timeoutSeconds':2,'failureThreshold':2}
+                                    if role=='gateway' else {'exec':{'command':['swanctl','--stats']},'periodSeconds':3}),
                     livenessProbe={'exec':{'command':['swanctl','--stats']},'initialDelaySeconds':30,'periodSeconds':10,'failureThreshold':6},
                     volumeMounts=[{'name':'run','mountPath':'/run'},
                         {'name':'ipsec','mountPath':'/etc/swanctl/swanctl.conf','subPath':'swanctl.conf','readOnly':True}]))
@@ -359,11 +375,19 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
         self.exec('provider','strongswan','swanctl','--initiate','--child','apn',allow=True)
 
     def datapath(self):
+        phase='support-client to APN TCP echo'
         try:
             self.echo('support-client', APN, source=CLIENT)
+            phase='APN to shared DNS aliases UDP/TCP policy'
             self.dns()
             return True
-        except (RuntimeError, AssertionError):
+        except (RuntimeError, AssertionError) as e:
+            failure={'phase':phase,'exception':self.redact(str(e)),
+                     'exception_type':type(e).__name__,'controller_mono_ns':time.monotonic_ns()}
+            previous=self.result.get('last_datapath_failure',{})
+            if (previous.get('phase'),previous.get('exception'))!=(phase,failure['exception']):
+                self.progress('datapath pending: '+phase+': '+failure['exception'])
+            self.result['last_datapath_failure']=failure
             return False
 
     def metrics(self):
@@ -388,8 +412,13 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
 
     def tests(self):
         for role in ('provider','gateway','dns','support','support-client'):
-            self.wait(lambda r=role:self.ready(r), role+' local readiness')
-        self.load()
+            self.progress('startup: waiting '+role+' readiness')
+            self.wait(lambda r=role:self.ready(r), role+' readiness')
+        self.progress('startup: image startup IKE established; capturing WG sublink state')
+        self.network_diagnostics('initial')
+        # Gateway datapath readiness already proves startup load-all and IKE;
+        # avoid reloading start_action=start connections and churning healthy SAs.
+        self.progress('startup: waiting support echo and APN DNS convergence')
         self.wait(self.datapath, 'IKE + support + DNS convergence')
         self.check('DNS policy both aliases UDP/TCP',self.dns)
         for role,target,source in [('provider',CLIENT,APN),('support-client',APN,CLIENT)]:
@@ -431,16 +460,32 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
         # defeat the failure window. Local VICI liveness remains independent.
         # Standard load-conns unloads configurations absent from the supplied file.
         # /dev/null is an empty configuration; no unsupported unload-conns command.
+        before=self.obj('pod','gateway')
+        identity={c['name']:(c['containerID'],c['restartCount']) for c in before['status']['containerStatuses']}
         self.exec('provider','strongswan','swanctl','--load-conns','--file','/dev/null')
         try:
             for role in ('provider','gateway'):
                 self.exec(role,'strongswan','swanctl','--terminate','--ike','apn',allow=True)
             self.wait(lambda:not self.datapath(),'datapath failure')
+            self.wait(lambda:not self.ready('gateway'),'gateway NotReady on datapath failure')
             for role in ('provider','gateway'):
                 self.exec(role,'strongswan','swanctl','--stats')
+            after=self.obj('pod','gateway')
+            assert after['metadata']['uid']==before['metadata']['uid']
+            assert identity=={c['name']:(c['containerID'],c['restartCount']) for c in after['status']['containerStatuses']}, 'datapath outage restarted a container'
+            def bootstrap_endpoints():
+                slices=json.loads(self.k('get','endpointslices','-n',self.ns,'-l',
+                    'kubernetes.io/service-name=ipsec-gateway','-o','json'))['items']
+                return any(ep.get('conditions',{}).get('ready') is True and
+                           ep.get('targetRef',{}).get('uid')==before['metadata']['uid']
+                           for item in slices for ep in item.get('endpoints',[]))
+            self.wait(bootstrap_endpoints,'IKE bootstrap ready endpoint despite datapath NotReady')
+            self.result['health_separation']={'gateway_not_ready':True,'daemon_live':True,
+                'container_identity_stable':True,'ike_bootstrap_endpoint_ready':True}
         finally:
             self.load()
         self.wait(self.datapath,'datapath recovery')
+        self.wait(lambda:self.ready('gateway'),'gateway Ready after APN recovery')
         return True
 
     def restart(self):
@@ -467,6 +512,32 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
                 assert c['containerID']==status[c['name']]['containerID']
         return True
 
+    def network_diagnostics(self, prefix):
+        """Read-only WG/routing evidence; explicitly selected wg fields exclude keys."""
+        try:
+            namespace=json.loads(self.k('get','namespace',self.ns,'-o','json',timeout=8))
+            if namespace['metadata'].get('labels',{}).get(OWNER)!=self.token:return
+        except BaseException:return
+        def collect(role,container,label,command):
+            try:
+                text=self.k('exec','-n',self.ns,role,'-c',container,'--',*command,timeout=8,allow=True)
+                path=self.out/(prefix+'-'+role+'-'+label+'.txt')
+                path.write_text(self.redact(text));os.chmod(path,0o600)
+            except BaseException as e:
+                self.result.setdefault('diagnostic_errors',[]).append(prefix+'-'+role+'-'+label+': '+type(e).__name__)
+        for role in ('gateway','dns','support','support-client'):
+            for field in ('endpoints','allowed-ips','latest-handshakes','transfer'):
+                collect(role,'wg-link','wg-'+field,['wg','show','all',field])
+            for label,cmd in [('addresses',['ip','-br','addr']),('routes',['ip','route','show','table','all']),
+                              ('rules',['ip','rule','show']),('forward-rpfilter',['sysctl','net.ipv4.ip_forward',
+                               'net.ipv4.conf.all.rp_filter','net.ipv4.conf.default.rp_filter','net.ipv4.conf.eth0.rp_filter'])]:
+                collect(role,'wg-link',label,cmd)
+        collect('support','wg-link','nft',['nft','-j','list','table','inet','wg_link'])
+        for label,cmd in [('xfrm-state-nokeys',['ip','-s','xfrm','state','list','nokeys']),
+                          ('xfrm-policy',['ip','xfrm','policy']),('routes',['ip','route','show','table','all']),
+                          ('rules',['ip','rule','show']),('addresses',['ip','-br','addr'])]:
+            collect('provider','strongswan',label,cmd)
+
     def diagnostics(self):
         """Best-effort bounded evidence; never collect Secrets or config manifests."""
         if not self.created:return
@@ -485,6 +556,7 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
             namespace=json.loads(self.k('get','namespace',self.ns,'-o','json',timeout=8))
             if namespace['metadata'].get('labels',{}).get(OWNER)!=self.token:return
         except BaseException:return
+        self.network_diagnostics('failure')
         pods=capture('failure-pods.txt','get','pods','-n',self.ns,'-o','wide')
         capture('failure-events.txt','get','events','-n',self.ns,'--sort-by=.metadata.creationTimestamp')
         try:
@@ -504,7 +576,7 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
             ('routes','wg-link',['ip','route','show','table','all']),
             ('nft','wg-link',['nft','-j','list','table','inet','wg_link']),
             ('xfrm-policy','strongswan',['ip','xfrm','policy']),
-            ('xfrm-state-nokeys','strongswan',['ip','-s','xfrm','state','nokeys'])]:
+            ('xfrm-state-nokeys','strongswan',['ip','-s','xfrm','state','list','nokeys'])]:
             capture('failure-gateway-'+name+'.txt','exec','-n',self.ns,'gateway','-c',container,'--',*command)
 
     def cleanup(self):
