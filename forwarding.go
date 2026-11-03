@@ -5,11 +5,20 @@ import (
 	"net/netip"
 )
 
-// Forwarding is opt-in, namespace-local routing between declared WireGuard links.
+// Forwarding is opt-in, namespace-local routing between explicitly scoped links.
 type Forwarding struct {
-	Enabled bool          `yaml:"enabled"`
-	Rules   []ForwardRule `yaml:"rules"`
+	Enabled            bool             `yaml:"enabled"`
+	ExternalInterfaces []string         `yaml:"externalInterfaces"`
+	Rules              []ForwardRule    `yaml:"rules"`
+	Masquerade         []MasqueradeRule `yaml:"masquerade"`
 }
+type MasqueradeRule struct {
+	From        string `yaml:"from"`
+	To          string `yaml:"to"`
+	Source      string `yaml:"source"`
+	Destination string `yaml:"destination"`
+}
+
 type ForwardRule struct {
 	From        string   `yaml:"from"`
 	To          string   `yaml:"to"`
@@ -24,16 +33,32 @@ func validateForwarding(c *Config) error {
 	if f == nil {
 		return nil
 	}
-	if !f.Enabled && len(f.Rules) > 0 {
-		return fmt.Errorf("disabled forwarding must not contain rules")
+	if !f.Enabled && (len(f.Rules) > 0 || len(f.Masquerade) > 0) {
+		return fmt.Errorf("disabled forwarding must not contain rules or masquerade")
 	}
 	names := map[string]bool{}
 	for _, n := range c.Interfaces {
 		names[n.Name] = true
 	}
+	for _, n := range f.ExternalInterfaces {
+		if !validForwardInterface(n) || names[n] {
+			return fmt.Errorf("externalInterfaces requires unique valid names distinct from declared WireGuard interfaces")
+		}
+		names[n] = true
+	}
+	for _, r := range f.Masquerade {
+		if !names[r.From] || !names[r.To] || !validForwardInterface(r.From) || !validForwardInterface(r.To) {
+			return fmt.Errorf("masquerade requires declared WireGuard or external interfaces")
+		}
+		s, se := netip.ParsePrefix(r.Source)
+		d, de := netip.ParsePrefix(r.Destination)
+		if se != nil || de != nil || s != s.Masked() || d != d.Masked() || !s.Addr().Is4() || !d.Addr().Is4() {
+			return fmt.Errorf("masquerade requires explicit canonical IPv4 source and destination CIDRs; IPv6 is unsupported")
+		}
+	}
 	for _, r := range f.Rules {
-		if !names[r.From] || !names[r.To] || !interfaceName.MatchString(r.From) || !interfaceName.MatchString(r.To) {
-			return fmt.Errorf("forwarding requires declared WireGuard interfaces")
+		if !names[r.From] || !names[r.To] || !validForwardInterface(r.From) || !validForwardInterface(r.To) {
+			return fmt.Errorf("forwarding requires declared WireGuard or external interfaces")
 		}
 		s, se := netip.ParsePrefix(r.Source)
 		d, de := netip.ParsePrefix(r.Destination)
@@ -75,4 +100,8 @@ func validateForwarding(c *Config) error {
 		}
 	}
 	return nil
+}
+
+func validForwardInterface(n string) bool {
+	return interfaceName.MatchString(n) && n != "." && n != ".."
 }

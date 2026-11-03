@@ -14,10 +14,11 @@ See the [three-node test report and measured recovery times](docs/dev-acceptance
 - Polling reload of configuration and key files, including Kubernetes projected
   volume updates (polled every second). Mount whole directories, **not `subPath`**. Key rotation can
   interrupt sessions and requires coordination with peers.
-- Optional, explicit forwarding ACLs between WireGuard interfaces managed by the
-  same container. Creating two interfaces alone does not enable forwarding.
-- **No NAT, provider-specific routing, general firewall, IPAM, or key-generation
-  management.** Supply return routes and any required external NAT separately.
+- Optional, explicit forwarding ACLs between owned WireGuard interfaces and
+  allowlisted namespace-local interfaces, with narrowly scoped IPv4 masquerading.
+  Creating interfaces alone does not enable forwarding.
+- **No provider-specific routing, general firewall, IPAM, or key-generation
+  management.** Supply routes separately.
   NetworkPolicy does not replace inner-tunnel ACLs.
 
 Requires Linux kernel WireGuard support already available on the node, reachable
@@ -97,7 +98,8 @@ state synchronization.
 ### Optional forwarding
 
 Set `forwarding.enabled: true` and declare explicit `rules` to forward traffic
-between WireGuard interfaces managed by this container. The example permits
+between WireGuard interfaces managed by this container or explicitly allowlisted
+namespace-local interfaces. The example permits
 only TCP destination port 443 from one access peer to a transit subnet.
 Forwarding does not add routes or change WireGuard `allowedIPs`; configure both
 and the remote return routes separately.
@@ -106,7 +108,7 @@ Each rule requires:
 
 | Field | Meaning |
 | --- | --- |
-| `from`, `to` | Ingress and egress interfaces declared in `interfaces`; only owned WireGuard links are supported |
+| `from`, `to` | Ingress and egress interfaces declared in `interfaces` or `forwarding.externalInterfaces`; the same interface is permitted |
 | `source`, `destination` | Canonical network CIDRs of the same address family; these select IPv4 or IPv6 |
 | `protocols` | Nonempty list of `icmp` (IPv4), `icmpv6` (IPv6), `tcp`, or `udp`; no duplicates |
 | `ports` | Optional unique integer destination ports, 1–65535; allowed only with TCP/UDP protocols |
@@ -114,7 +116,45 @@ Each rule requires:
 Omitting `ports` or using `ports: []` permits **all destination ports** for the
 listed TCP/UDP protocols. Use separate rules for ICMP and port-limited TCP/UDP.
 An enabled configuration with no rules denies all forwarded traffic involving
-owned interfaces. A disabled configuration must not contain rules.
+scoped interfaces. A disabled configuration must not contain rules or masquerade entries.
+
+#### External interfaces and IPv4 masquerading
+
+`externalInterfaces` is an optional list of existing namespace-local interface
+names, for example `[eth0]`. Names must be valid, unique, and distinct from
+`interfaces`; `.` and `..` are invalid. External links must not carry the wg-link
+ownership alias. wg-link never creates, deletes, or reconfigures these links.
+Enabled configurations require every listed link to exist before allows commit;
+remote tunnel/SA availability is not checked. Adding `eth0` scopes its forwarded
+traffic to this firewall's default deny, so declare every required flow explicitly.
+
+```yaml
+forwarding:
+  enabled: true
+  externalInterfaces: [eth0]
+  rules:
+    - from: eth0
+      to: eth0
+      source: 198.18.10.0/24
+      destination: 203.0.113.0/24
+      protocols: [tcp, udp]
+  masquerade:
+    - from: eth0
+      to: eth0
+      source: 198.18.10.0/24
+      destination: 203.0.113.0/24
+```
+
+Each `masquerade` entry requires `from`, `to`, `source`, and `destination`.
+Endpoints use the same interface declarations as ACLs; source and destination
+must both be explicit canonical IPv4 CIDRs. IPv6 NAT is rejected. There are no
+NAT protocol/port fields: filter rules govern permitted flows. Same-interface
+forwarding supports policy-based IPsec ingress and Internet egress on one link.
+The owned `inet wg_link` table's NAT postrouting chain uses priority `srcnat` and
+matches original ingress (`iifname`), egress (`oifname`), source, and destination
+before `masquerade`. Destinations outside the configured NAT prefixes remain
+untranslated. NAT alone grants no forwarding permission. No global ruleset flush
+or foreign table changes occur.
 
 Each allow rule admits matching new/established traffic and exact per-rule
 reverse `ESTABLISHED` replies: reversed interfaces and CIDRs, the same protocol,
@@ -124,7 +164,7 @@ existing connections unless another current rule permits them. There is **no
 broad `RELATED` allowance**; related ICMP errors are conservatively denied.
 
 The scoped default is drop for any forwarded packet entering or leaving an
-owned interface unless explicitly allowed. Unrelated forwarding is unchanged;
+owned or allowlisted external interface unless explicitly allowed. Unrelated forwarding is unchanged;
 other firewall tables can still deny permitted traffic. These ACLs do not manage
 traffic to/from the container itself or provide a general firewall.
 
@@ -135,7 +175,8 @@ Do not share the table or its ownership marker with other processes.
 
 Changed configurations first stage a deny-only boundary, validate required
 forwarding sysctls and reconcile interfaces, peers and routes. Only then are the
-final allows committed. A failed reconciliation remains denied; a successful
+final allows and NAT committed. Deny-only staging and disabled configurations
+contain no NAT rules. A failed reconciliation remains denied; a successful
 reload can briefly interrupt forwarding. Unchanged configurations do not churn
 the ruleset. Address-generated routes that would shadow another interface's
 explicit routes are rejected before network changes.
@@ -146,7 +187,7 @@ and agent restarts in the same network namespace. Forwarding sysctls remain
 unchanged. Clean removal requires Pod/network-namespace recreation or deliberate
 operator cleanup after reviewing leak risk; stopping the agent is not cleanup.
 
-Only families used by enabled rules require forwarding sysctls:
+Only families used by enabled rules (or IPv4 masquerading) require forwarding sysctls:
 `net.ipv4.ip_forward=1` and/or `net.ipv6.conf.all.forwarding=1`. If already `1`,
 the agent skips writing. Otherwise it attempts to enable the required family;
 a read-only `/proc/sys` causes reconciliation to fail. Preconfigure the values

@@ -46,3 +46,20 @@ forwarding:
 # After first enablement, disabling/omitting retains a deny-only boundary and
 # historical interface names; it does not reset sysctls. Recreate the Pod network
 # namespace or arrange deliberate operator cleanup to remove that boundary.
+
+# Optional external-link/NAT extension (merge into forwarding above):
+# externalInterfaces: [eth0] # Existing namespace-local link, never managed by wg-link.
+# rules:
+#   - from: eth0
+#     to: eth0
+#     source: 198.18.10.0/24
+#     destination: 203.0.113.0/24
+#     protocols: [tcp, udp]
+# masquerade:
+#   - from: eth0
+#     to: eth0
+#     source: 198.18.10.0/24
+#     destination: 203.0.113.0/24
+# NAT requires enabled forwarding and explicit canonical IPv4 source/destination.
+# Match both ingress and egress; unrelated destinations are not translated.
+# All forwarding involving an allowlisted external link is denied without ACLs.

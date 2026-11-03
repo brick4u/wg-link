@@ -28,6 +28,8 @@ type forwardingState struct {
 	pending         string // Final ACL, eligible for commit only after sysctl validation.
 	committedConfig [32]byte
 	pendingConfig   [32]byte
+	externalExists  func(string) error
+	pendingExternal []string
 }
 
 func runNFT(ctx context.Context, input string, args ...string) ([]byte, error) {
@@ -44,15 +46,34 @@ func (b *LinuxBackend) ApplyForwarding(c *Config) error {
 	if err != nil {
 		return err
 	}
+	c, err = scopeForwardingLinks(c, links)
+	if err != nil {
+		return err
+	}
+	return b.forwarding.apply(c)
+}
+
+// scopeForwardingLinks only observes external links; only owned WireGuard links
+// may be added to the backend's declared-link scope for stale-link denial.
+func scopeForwardingLinks(c *Config, links []netlink.Link) (*Config, error) {
 	declared := map[string]bool{}
 	for _, n := range c.Interfaces {
 		declared[n.Name] = true
 	}
+	external := map[string]bool{}
+	if c.Forwarding != nil {
+		for _, n := range c.Forwarding.ExternalInterfaces {
+			external[n] = true
+		}
+	}
 	// Check ownership before changing a firewall boundary or any sysctl.
 	for _, l := range links {
 		owned := l.Type() == "wireguard" && l.Attrs().Alias == ownerAlias
+		if external[l.Attrs().Name] && l.Attrs().Alias == ownerAlias {
+			return nil, fmt.Errorf("external interface %s conflicts with wg-link ownership", l.Attrs().Name)
+		}
 		if declared[l.Attrs().Name] && !owned {
-			return fmt.Errorf("refusing foreign interface %s", l.Attrs().Name)
+			return nil, fmt.Errorf("refusing foreign interface %s", l.Attrs().Name)
 		}
 		if owned && !declared[l.Attrs().Name] {
 			// Also guard stale owned links until Apply removes them.
@@ -62,7 +83,7 @@ func (b *LinuxBackend) ApplyForwarding(c *Config) error {
 			declared[l.Attrs().Name] = true
 		}
 	}
-	return b.forwarding.apply(c)
+	return c, nil
 }
 func (b *LinuxBackend) CommitForwarding(*Config) error { return b.forwarding.commit() }
 
@@ -70,6 +91,11 @@ func (s *forwardingState) commit() error {
 	if s.pending == "" {
 		s.committedConfig = s.pendingConfig
 		return nil
+	}
+	for _, n := range s.pendingExternal {
+		if err := s.externalExists(n); err != nil {
+			return fmt.Errorf("external interface %s: %w", n, err)
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -84,8 +110,21 @@ func (s *forwardingState) commit() error {
 
 func (s *forwardingState) apply(c *Config) error {
 	s.pending = ""
+	s.pendingExternal = nil
 	if err := validateForwarding(c); err != nil {
 		return err
+	}
+	if s.externalExists == nil {
+		s.externalExists = func(n string) error {
+			l, err := netlink.LinkByName(n)
+			if err != nil {
+				return err
+			}
+			if l.Attrs().Alias == ownerAlias {
+				return fmt.Errorf("conflicts with wg-link ownership")
+			}
+			return nil
+		}
 	}
 	if s.run == nil {
 		s.run = runNFT
@@ -142,7 +181,7 @@ func (s *forwardingState) apply(c *Config) error {
 			}
 			if v.Set != nil && v.Set.Name == "owned_interfaces" {
 				for _, n := range v.Set.Elem {
-					if !interfaceName.MatchString(n) {
+					if !validForwardInterface(n) {
 						return fmt.Errorf("invalid owned nft interface")
 					}
 					names[n] = true
@@ -160,6 +199,11 @@ func (s *forwardingState) apply(c *Config) error {
 	}
 	for _, n := range c.Interfaces {
 		names[n.Name] = true
+	}
+	if c.Forwarding != nil {
+		for _, n := range c.Forwarding.ExternalInterfaces {
+			names[n] = true
+		}
 	}
 	batch := renderForwarding(c, names)
 	// Include routes, peer declarations and loaded key material, not just ACLs:
@@ -192,10 +236,19 @@ func (s *forwardingState) apply(c *Config) error {
 		}
 	}
 	if enabled {
+		for _, n := range c.Forwarding.ExternalInterfaces {
+			if err := s.externalExists(n); err != nil {
+				return fmt.Errorf("external interface %s: %w", n, err)
+			}
+		}
+		s.pendingExternal = append([]string(nil), c.Forwarding.ExternalInterfaces...)
 		families := map[bool]bool{}
 		for _, r := range c.Forwarding.Rules {
 			p, _ := netip.ParsePrefix(r.Source)
 			families[p.Addr().Is4()] = true
+		}
+		if len(c.Forwarding.Masquerade) > 0 {
+			families[true] = true
 		}
 		for _, ipv4 := range []bool{true, false} {
 			if !families[ipv4] {
@@ -240,6 +293,12 @@ func renderForwarding(c *Config, names map[string]bool) string {
 	fmt.Fprintf(&b, "add set inet wg_link owned_interfaces { type ifname; elements = { %s }; }\n", strings.Join(ns, ", "))
 	b.WriteString("add chain inet wg_link forward { type filter hook forward priority 0; policy accept; }\n")
 	if c.Forwarding != nil && c.Forwarding.Enabled {
+		if len(c.Forwarding.Masquerade) > 0 {
+			b.WriteString("add chain inet wg_link postrouting { type nat hook postrouting priority srcnat; policy accept; }\n")
+			for _, r := range c.Forwarding.Masquerade {
+				fmt.Fprintf(&b, "add rule inet wg_link postrouting iifname %q oifname %q ip saddr %s ip daddr %s counter masquerade\n", r.From, r.To, r.Source, r.Destination)
+			}
+		}
 		for _, r := range c.Forwarding.Rules {
 			prefix, _ := netip.ParsePrefix(r.Source)
 			family := "ip"
