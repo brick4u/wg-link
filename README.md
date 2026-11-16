@@ -16,7 +16,8 @@ and the [integrated IPSec, DNS, NAT and monitoring test](docs/system-acceptance-
   volume updates (polled every second). Mount whole directories, **not `subPath`**. Key rotation can
   interrupt sessions and requires coordination with peers.
 - Optional, explicit forwarding ACLs between owned WireGuard interfaces and
-  allowlisted namespace-local interfaces, with narrowly scoped IPv4 masquerading.
+  allowlisted namespace-local interfaces, with narrowly scoped IPv4 masquerading
+  and destination NAT.
   Creating interfaces alone does not enable forwarding.
 - **No provider-specific routing, general firewall, IPAM, or key-generation
   management.** Supply routes separately.
@@ -117,7 +118,8 @@ Each rule requires:
 Omitting `ports` or using `ports: []` permits **all destination ports** for the
 listed TCP/UDP protocols. Use separate rules for ICMP and port-limited TCP/UDP.
 An enabled configuration with no rules denies all forwarded traffic involving
-scoped interfaces. A disabled configuration must not contain rules or masquerade entries.
+scoped interfaces. A disabled configuration must not contain rules, masquerade,
+or DNAT entries.
 
 #### External interfaces and IPv4 masquerading
 
@@ -160,6 +162,74 @@ before `masquerade`. Destinations outside the configured NAT prefixes remain
 untranslated. NAT alone grants no forwarding permission. No global ruleset flush
 or foreign table changes occur.
 
+#### Scoped IPv4 destination NAT
+
+`forwarding.dnat` translates an explicit original destination and service port
+in the owned table's NAT `prerouting` chain, at priority `dstnat`:
+
+```yaml
+forwarding:
+  enabled: true
+  externalInterfaces: [eth0]
+  dnat:
+    - from: eth0
+      source: 198.18.10.0/24
+      destination: 192.0.2.80/32
+      protocol: tcp
+      port: 12101
+      targetIPAddress: 198.18.60.1
+      targetPort: 1883
+  rules:
+    - from: eth0
+      to: wg-proxy
+      source: 198.18.10.0/24
+      destination: 198.18.60.1/32
+      protocols: [tcp]
+      ports: [1883]
+```
+
+Declare `wg-proxy` in `interfaces` and configure its peer, `allowedIPs`, routes,
+and return path separately. All addresses above are documentation/test addresses.
+
+| DNAT field | Requirement |
+| --- | --- |
+| `from` | Valid ingress interface declared in `interfaces` or `externalInterfaces` |
+| `source` | Explicit canonical IPv4 CIDR |
+| `destination` | Explicit canonical IPv4 **/32** CIDR |
+| `protocol` | `tcp` or `udp` |
+| `port` | Original destination port, integer 1–65535 |
+| `targetIPAddress` | Literal IPv4 address, not a hostname or CIDR |
+| `targetPort` | Mandatory translated destination port, integer 1–65535 |
+
+The rule matches ingress, source, original destination, protocol, and destination
+port before `counter dnat ip to IP:port`. Duplicate or overlapping source matches
+for the same ingress, original destination, protocol, and port are rejected,
+even with identical targets. Different original ports on the same public IP are
+supported. There is no output DNAT or automatic SNAT. To preserve the APN source,
+do not configure a matching masquerade rule for the translated proxy flow.
+
+Forwarding ACLs run **after DNAT**: grant the translated destination and target
+port, not the original public IP/port. Reverse ACLs match the proxy's source IP
+and target service port before reverse NAT. NAT alone grants no forwarding
+permission. These ACLs cover routed traffic; a target local to the agent's own
+network namespace traverses INPUT, not FORWARD, and is not protected by them.
+
+For an APN proxy topology, use a separate HAProxy + wg-link Pod per broker with
+a stable internal proxy address routed over WireGuard. DNAT the broker's original
+public IP/port to that proxy IP/port without masquerading. HAProxy receives the
+APN source and opens the broker connection with `send-proxy-v2`; enable PROXY
+protocol on the corresponding VerneMQ listener. HAProxy must only accept trusted
+APN traffic, and the VerneMQ PROXY listener must only accept trusted proxies.
+Neither HAProxy nor VerneMQ configuration is managed by wg-link.
+
+NAT is stateful: existing connections follow their existing conntrack bindings,
+including after a DNAT rule is removed or its target changes. wg-link does not
+flush conntrack. Removing the corresponding forwarding ACL denies those routed
+connections unless another current ACL permits the same translated flow. Removing
+only a DNAT rule does **not** revoke existing sessions when the target remains
+allowed, including targets shared by other rules. Stage or disable forwarding to
+remove all scoped allows; deny-only staging contains no NAT chains or rules.
+
 Each allow rule admits matching new/established traffic and exact per-rule
 reverse `ESTABLISHED` replies: reversed interfaces and CIDRs, the same protocol,
 and source ports matching the original destination ports when restricted.
@@ -191,7 +261,7 @@ and agent restarts in the same network namespace. Forwarding sysctls remain
 unchanged. Clean removal requires Pod/network-namespace recreation or deliberate
 operator cleanup after reviewing leak risk; stopping the agent is not cleanup.
 
-Only families used by enabled rules (or IPv4 masquerading) require forwarding sysctls:
+Only families used by enabled rules (or IPv4 masquerading/DNAT) require forwarding sysctls:
 `net.ipv4.ip_forward=1` and/or `net.ipv6.conf.all.forwarding=1`. If already `1`,
 the agent skips writing. Otherwise it attempts to enable the required family;
 a read-only `/proc/sys` causes reconciliation to fail. Preconfigure the values

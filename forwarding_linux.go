@@ -247,7 +247,7 @@ func (s *forwardingState) apply(c *Config) error {
 			p, _ := netip.ParsePrefix(r.Source)
 			families[p.Addr().Is4()] = true
 		}
-		if len(c.Forwarding.Masquerade) > 0 {
+		if len(c.Forwarding.Masquerade) > 0 || len(c.Forwarding.DNAT) > 0 {
 			families[true] = true
 		}
 		for _, ipv4 := range []bool{true, false} {
@@ -293,6 +293,12 @@ func renderForwarding(c *Config, names map[string]bool) string {
 	fmt.Fprintf(&b, "add set inet wg_link owned_interfaces { type ifname; elements = { %s }; }\n", strings.Join(ns, ", "))
 	b.WriteString("add chain inet wg_link forward { type filter hook forward priority 0; policy accept; }\n")
 	if c.Forwarding != nil && c.Forwarding.Enabled {
+		if len(c.Forwarding.DNAT) > 0 {
+			b.WriteString("add chain inet wg_link prerouting { type nat hook prerouting priority dstnat; policy accept; }\n")
+			for _, r := range c.Forwarding.DNAT {
+				fmt.Fprintf(&b, "add rule inet wg_link prerouting iifname %q ip saddr %s ip daddr %s %s dport %d counter dnat ip to %s:%d\n", r.From, r.Source, r.Destination, r.Protocol, r.Port, r.TargetIPAddress, r.TargetPort)
+			}
+		}
 		if len(c.Forwarding.Masquerade) > 0 {
 			b.WriteString("add chain inet wg_link postrouting { type nat hook postrouting priority srcnat; policy accept; }\n")
 			for _, r := range c.Forwarding.Masquerade {

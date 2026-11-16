@@ -3,6 +3,8 @@ package wglink
 import (
 	"fmt"
 	"net/netip"
+
+	"go.yaml.in/yaml/v3"
 )
 
 // Forwarding is opt-in, namespace-local routing between explicitly scoped links.
@@ -11,7 +13,44 @@ type Forwarding struct {
 	ExternalInterfaces []string         `yaml:"externalInterfaces"`
 	Rules              []ForwardRule    `yaml:"rules"`
 	Masquerade         []MasqueradeRule `yaml:"masquerade"`
+	DNAT               []DNATRule       `yaml:"dnat"`
 }
+
+// DNATRule translates an explicitly scoped IPv4 destination; forwarding ACLs
+// independently authorize the translated destination and service port.
+type DNATRule struct {
+	From            string `yaml:"from"`
+	Source          string `yaml:"source"`
+	Destination     string `yaml:"destination"`
+	Protocol        string `yaml:"protocol"`
+	Port            int    `yaml:"port"`
+	TargetIPAddress string `yaml:"targetIPAddress"`
+	TargetPort      int    `yaml:"targetPort"`
+}
+
+// UnmarshalYAML prevents YAML's float-to-int coercion for service ports.
+// Node.Decode does not inherit the outer decoder's KnownFields setting, so
+// reject unknown fields here as well.
+func (r *DNATRule) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind != yaml.MappingNode {
+		return fmt.Errorf("dnat entry must be a mapping")
+	}
+	for i := 0; i < len(n.Content); i += 2 {
+		key, value := n.Content[i], n.Content[i+1]
+		switch key.Value {
+		case "from", "source", "destination", "protocol", "targetIPAddress":
+		case "port", "targetPort":
+			if value.Kind != yaml.ScalarNode || value.Tag != "!!int" {
+				return fmt.Errorf("dnat %s must be an integer", key.Value)
+			}
+		default:
+			return fmt.Errorf("unknown dnat field %q", key.Value)
+		}
+	}
+	type plain DNATRule
+	return n.Decode((*plain)(r))
+}
+
 type MasqueradeRule struct {
 	From        string `yaml:"from"`
 	To          string `yaml:"to"`
@@ -33,8 +72,8 @@ func validateForwarding(c *Config) error {
 	if f == nil {
 		return nil
 	}
-	if !f.Enabled && (len(f.Rules) > 0 || len(f.Masquerade) > 0) {
-		return fmt.Errorf("disabled forwarding must not contain rules or masquerade")
+	if !f.Enabled && (len(f.Rules) > 0 || len(f.Masquerade) > 0 || len(f.DNAT) > 0) {
+		return fmt.Errorf("disabled forwarding must not contain rules, masquerade or dnat")
 	}
 	names := map[string]bool{}
 	for _, n := range c.Interfaces {
@@ -45,6 +84,32 @@ func validateForwarding(c *Config) error {
 			return fmt.Errorf("externalInterfaces requires unique valid names distinct from declared WireGuard interfaces")
 		}
 		names[n] = true
+	}
+	for i, r := range f.DNAT {
+		if !names[r.From] || !validForwardInterface(r.From) {
+			return fmt.Errorf("dnat requires a declared WireGuard or external ingress interface")
+		}
+		s, se := netip.ParsePrefix(r.Source)
+		d, de := netip.ParsePrefix(r.Destination)
+		if se != nil || de != nil || !s.Addr().Is4() || !d.Addr().Is4() || s != s.Masked() || d != d.Masked() || s.String() != r.Source || d.String() != r.Destination || d.Bits() != 32 {
+			return fmt.Errorf("dnat requires canonical IPv4 source and destination CIDRs, with destination /32")
+		}
+		if r.Protocol != "tcp" && r.Protocol != "udp" {
+			return fmt.Errorf("dnat protocol must be tcp or udp")
+		}
+		if r.Port < 1 || r.Port > 65535 || r.TargetPort < 1 || r.TargetPort > 65535 {
+			return fmt.Errorf("dnat port and targetPort must be integers 1..65535")
+		}
+		target, err := netip.ParseAddr(r.TargetIPAddress)
+		if err != nil || !target.Is4() {
+			return fmt.Errorf("dnat targetIPAddress must be a literal IPv4 address")
+		}
+		for _, prior := range f.DNAT[:i] {
+			ps, _ := netip.ParsePrefix(prior.Source)
+			if r.From == prior.From && r.Destination == prior.Destination && r.Protocol == prior.Protocol && r.Port == prior.Port && s.Overlaps(ps) {
+				return fmt.Errorf("dnat rules must not have duplicate or overlapping matches")
+			}
+		}
 	}
 	for _, r := range f.Masquerade {
 		if !names[r.From] || !names[r.To] || !validForwardInterface(r.From) || !validForwardInterface(r.To) {
