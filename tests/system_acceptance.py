@@ -6,8 +6,10 @@ supplies three distinct node names and kubeconfig; no environment defaults apply
 Only namespace-scoped resources are changed. Namespace deletion is unconditional
 on exit, but guarded by a unique ownership label. SIGINT/SIGTERM use that path.
 
-Topology: provider (IKE only) -> gateway -> DNS and support transit; external
-support client -> support -> gateway -> APN. A sixth Pod is a mock Internet sink.
+Topology: provider (IKE only) -> gateway -> two independent DNS/WG Pods,
+three independent HAProxy/WG Deployments and support transit. Three real VerneMQ
+Pods sit behind normal ClusterIP Services; HAProxy supplies PROXYv2 source identity.
+The external support client and mock Internet sink retain their isolated paths.
 Provider/gateway use standard image entrypoints and swanctl load-all. The strongSwan
 image must load /etc/strongswan.conf, start charon as PID 1, provide swanctl, and
 read /etc/swanctl/swanctl.conf. Exporter flags follow torilabs v1.10.2.
@@ -35,6 +37,10 @@ OWNER = 'wg-link.test/owner'
 APN = '198.18.10.2'
 DNS = ['198.18.53.1', '198.18.53.2']
 CLIENT = '198.18.40.2'
+BROKER_IP = '192.0.2.80'
+BROKER_PORTS = [12101, 12201, 1883]
+BROKER_VIPS = ['198.18.60.1', '198.18.60.2', '198.18.60.3']
+MQTT_PROBE = Path(__file__).with_name('system_mqtt_probe.py').read_text()
 # Reuse the existing generic echo/ICMP implementation without importing its CLI.
 _spec = importlib.util.spec_from_file_location('wg_accept_probe', Path(__file__).with_name('kubernetes_acceptance.py'))
 _module = importlib.util.module_from_spec(_spec)
@@ -83,7 +89,12 @@ print(json.dumps({'ok':True,'answers':answers,'transport':proto,'server':dst,'so
 '''
 
 
-class Harness:
+_broker_spec = importlib.util.spec_from_file_location('wg_system_brokers', Path(__file__).with_name('system_broker_acceptance.py'))
+_broker_module = importlib.util.module_from_spec(_broker_spec)
+_broker_spec.loader.exec_module(_broker_module)
+
+
+class Harness(_broker_module.BrokerAcceptance):
     def __init__(self, args):
         self.a = args
         self.token = uuid.uuid4().hex
@@ -94,7 +105,7 @@ class Harness:
         self.out.mkdir(parents=True, exist_ok=True)
         os.chmod(self.out, 0o700)
         self.result = {'schema': 1, 'checks': [], 'images': {k: getattr(args, k) for k in
-                       ('wg_image', 'strongswan_image', 'unbound_image', 'exporter_image', 'probe_image')},
+                       ('wg_image', 'strongswan_image', 'unbound_image', 'exporter_image', 'probe_image', 'haproxy_image', 'broker_image')},
                        'scope': {'ip_family': 'IPv4', 'dns': 'static policy answers',
                                        'peer': 'simulated APN', 'egress': 'mock Internet endpoint'}}
 
@@ -202,7 +213,7 @@ class Harness:
         # Never adopt/relabel an existing namespace, even on a UUID collision.
         self.k('create','-f','-',data=json.dumps(ns))
         objects = [self.resource('ServiceAccount', 'wg-link'), self.resource('ConfigMap', 'probe',
-                   data={'probe.py': PROBE, 'dns.py': DNS_PROBE})]
+                   data={'probe.py': PROBE, 'dns.py': DNS_PROBE, 'mqtt.py': MQTT_PROBE})]
         role = self.resource('Role', 'discovery', rules=[
             {'apiGroups': [''], 'resources': ['services'], 'verbs': ['get', 'list', 'watch']},
             {'apiGroups': ['discovery.k8s.io'], 'resources': ['endpointslices'], 'verbs': ['get', 'list', 'watch']}])
@@ -220,8 +231,20 @@ class Harness:
         self.topology()
 
     def topology(self):
+        # Allocate outer-IKE bootstrap Services before generating swanctl config.
+        # A literal ClusterIP avoids resolving cluster DNS through the APN-selected
+        # table-220 default route while that same tunnel is unavailable.
+        ike_gateway = self.service('ipsec-gateway', 'gateway', [('ike',500),('natt',4500)])
+        ike_gateway['spec']['publishNotReadyAddresses'] = True
+        provider_peer = self.service('provider-peer', 'provider', [('ike',500),('natt',4500)])
+        self.apply([ike_gateway, provider_peer])
+        self.ike_gateway_ip = self.obj('service', 'ipsec-gateway')['spec']['clusterIP']
+        import ipaddress
+        assert ipaddress.ip_address(self.ike_gateway_ip).version == 4, 'outer IKE requires an allocated IPv4 ClusterIP'
+        self.result['ike_bootstrap'] = {'gateway_service_ip': self.ike_gateway_ip,
+            'remote_resolution': 'literal ClusterIP; no tunnel-dependent DNS lookup'}
         keys = {}
-        for name in ('gd', 'gt', 'dns', 'st', 'sa', 'client'):
+        for name in ('gd', 'gt', 'gb', 'dns-1', 'dns-2', 'proxy-1', 'proxy-2', 'proxy-3', 'st', 'sa', 'client'):
             private = self.run(['docker', 'run', '--rm', '--network=none', '--entrypoint', 'wg', self.a.wg_image, 'genkey']).strip()
             public = self.run(['docker', 'run', '--rm', '-i', '--network=none', '--entrypoint', 'wg', self.a.wg_image, 'pubkey'], private+'\n').strip()
             self.sensitive += [private, public]
@@ -232,13 +255,27 @@ class Harness:
                 'persistentKeepalive': 1, 'service': {'namespace': self.ns, 'name': service, 'port': 'p'+str(port)}}]}
         cfg = {
             'gateway': {'interfaces': [
-                iface('wg-dns', 'gd', ['198.18.51.1/32'], ['198.18.53.0/24'], 'dns', ['198.18.53.0/24'], 'dns', 51820),
+                iface('wg-dns', 'gd', ['198.18.51.1/32'], [x+'/32' for x in DNS], 'dns-1', [DNS[0]+'/32'], 'dns-1', 51820),
                 iface('wg-transit', 'gt', ['198.18.52.1/32'], ['198.18.40.0/24'], 'st', ['198.18.40.0/24'], 'support', 51822)]},
-            'dns': {'interfaces': [iface('wg-dns', 'dns', [x+'/32' for x in DNS], ['198.18.10.0/24'], 'gd', ['198.18.10.0/24'], 'gateway', 51820)]},
             'support': {'interfaces': [
                 iface('wg-support', 'sa', ['198.18.40.1/32'], [CLIENT+'/32'], 'client', [CLIENT+'/32'], 'support-client', 51821),
                 iface('wg-transit', 'st', ['198.18.52.2/32'], ['198.18.10.0/24'], 'gt', ['198.18.10.0/24'], 'gateway', 51822)]},
             'support-client': {'interfaces': [iface('wg-support', 'client', [CLIENT+'/32'], ['198.18.10.0/24'], 'sa', ['198.18.10.0/24'], 'support', 51821)]}}
+        cfg['gateway']['interfaces'][0]['peers'].append(
+            iface('wg-dns', 'gd', [], [], 'dns-2', [DNS[1]+'/32'], 'dns-2', 51820)['peers'][0])
+        for i, alias in enumerate(DNS, 1):
+            name = 'dns-'+str(i)
+            cfg[name] = {'interfaces': [iface('wg-dns', name, [alias+'/32'], ['198.18.10.0/24'],
+                                         'gd', ['198.18.10.0/24'], 'gateway', 51820)]}
+        broker_if = iface('wg-broker', 'gb', ['198.18.61.1/32'], [v+'/32' for v in BROKER_VIPS],
+                          'proxy-1', [BROKER_VIPS[0]+'/32'], 'proxy-1', 51823)
+        for i, vip in enumerate(BROKER_VIPS, 1):
+            name = 'proxy-'+str(i)
+            if i > 1:
+                broker_if['peers'].append(iface('wg-broker', 'gb', [], [], name, [vip+'/32'], name, 51823)['peers'][0])
+            cfg[name] = {'interfaces': [iface('wg-broker', name, [vip+'/32'], ['198.18.10.0/24'],
+                                            'gb', ['198.18.10.0/24'], 'gateway', 51823)]}
+        cfg['gateway']['interfaces'].append(broker_if)
         def rule(frm, to, src, dst, protocols, ports=None):
             v = {'from': frm, 'to': to, 'source': src, 'destination': dst, 'protocols': protocols}
             if ports: v['ports'] = ports
@@ -253,8 +290,15 @@ class Harness:
             if interface == 'wg-transit':
                 rules += [rule('eth0', interface, '198.18.10.0/24', dst, ['icmp']),
                           rule(interface, 'eth0', dst, '198.18.10.0/24', ['icmp'])]
+        for vip in BROKER_VIPS:
+            rules.append(rule('eth0', 'wg-broker', '198.18.10.0/24', vip+'/32', ['tcp'], [1883]))
         cfg['gateway']['forwarding'] = {'enabled': True, 'externalInterfaces': ['eth0'], 'rules': rules,
             'masquerade': [{'from': 'eth0', 'to': 'eth0', 'source': '198.18.10.0/24', 'destination': self.sink+'/32'}]}
+        cfg['gateway']['forwarding']['dnat'] = [
+            {'from': 'eth0', 'source': '198.18.10.0/24', 'destination': BROKER_IP+'/32',
+             'protocol': 'tcp', 'port': port, 'targetIPAddress': vip, 'targetPort': 1883}
+            for port, vip in zip(BROKER_PORTS, BROKER_VIPS)]
+        self.per_broker_config = cfg
         cfg['support']['forwarding'] = {'enabled': True, 'rules': [
             rule(f, t, s, d, protos, ports) for f,t,s,d in [
                 ('wg-support','wg-transit',CLIENT+'/32','198.18.10.0/24'),
@@ -262,11 +306,12 @@ class Harness:
             for protos,ports in [(['icmp'],None), (['tcp','udp'],[18080])]]}
         objects = []
         for role, config in cfg.items():
-            used = {'gateway': ['gd','gt'], 'dns': ['dns'], 'support': ['st','sa'], 'support-client': ['client']}[role]
+            used = ({'gateway': ['gd','gt','gb'], 'support': ['st','sa'], 'support-client': ['client']}.get(role, [role]))
             objects += [self.resource('ConfigMap', role, data={'config.yaml': json.dumps(config)}),
                         self.resource('Secret', role, type='Opaque', data={k: base64.b64encode(keys[k][0].encode()).decode() for k in used})]
-            ports = {'gateway': [51820,51822], 'dns': [51820], 'support': [51821,51822], 'support-client': [51821]}[role]
+            ports = ({'gateway': [51820,51822,51823], 'support': [51821,51822], 'support-client': [51821]}.get(role, [51820 if role.startswith('dns-') else 51823]))
             objects.append(self.service(role, role, [('p'+str(p),p) for p in ports]))
+        self.broker_resources(objects)
         psk = secrets.token_hex(32)
         self.sensitive.append(psk)
         for role, remote, localid, remoteid, localts, remotets, action in [
@@ -274,7 +319,9 @@ class Harness:
             ('provider','ipsec-gateway','provider.example','gateway.example','198.18.10.0/24','0.0.0.0/0','start')]:
             sw = f'''connections {{ apn {{ version = 1
  local_addrs = %any
- remote_addrs = {('%any' if role=='gateway' else remote+'.'+self.ns+'.svc.cluster.local')}
+ remote_addrs = {('%any' if role=='gateway' else self.ike_gateway_ip)}
+ local_port = 500
+ remote_port = 500
  proposals = aes256-sha256-ecp384
  encap = yes
  keyingtries = 0
@@ -289,11 +336,6 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
             # Preserve image defaults, including charon start-scripts load-all,
             # stderr logging, plugin loading and the standard /run VICI socket.
             objects.append(self.resource('Secret', role+'-ipsec', stringData={'swanctl.conf': sw}))
-            ike_service=self.service('ipsec-gateway' if role=='gateway' else 'provider-peer', role, [('ike',500),('natt',4500)])
-            # Only outer IKE bootstrap bypasses datapath readiness. WireGuard
-            # discovery retains normal ready EndpointSlice selection.
-            if role=='gateway':ike_service['spec']['publishNotReadyAddresses']=True
-            objects.append(ike_service)
         unbound = '''server:
  interface: 0.0.0.0
  interface-automatic: yes
@@ -316,7 +358,7 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
  local-data: "sinkhole.example. 60 IN A 127.0.0.1"
 '''
         objects.append(self.resource('ConfigMap', 'unbound', data={'unbound.conf': unbound}))
-        for role, node in [('provider',self.a.nodes[0]),('gateway',self.a.nodes[1]),('dns',self.a.nodes[2]),
+        for role, node in [('provider',self.a.nodes[0]),('gateway',self.a.nodes[1]),('dns-1',self.a.nodes[2]),('dns-2',self.a.nodes[0]),
                            ('support',self.a.nodes[0]),('support-client',self.a.nodes[2])]:
             volumes = [{'name':'probe','configMap':{'name':'probe'}}]
             containers = []
@@ -326,7 +368,7 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
                     args=['-config','/config/config.yaml','-listen',':9090'],
                     readinessProbe={'httpGet':{'path':'/readyz','port':9090},'periodSeconds':2},
                     volumeMounts=[{'name':'config','mountPath':'/config','readOnly':True},{'name':'keys','mountPath':'/keys','readOnly':True}]))
-            source = {'provider':APN, 'gateway':'198.18.51.1', 'dns':DNS[0], 'support': '198.18.40.1', 'support-client':CLIENT}[role]
+            source = {'provider':APN, 'gateway':'198.18.51.1', 'dns-1':DNS[0], 'dns-2':DNS[1], 'support': '198.18.40.1', 'support-client':CLIENT}[role]
             containers.append(self.probe(source))
             init = []
             if role in ('gateway','provider'):
@@ -339,12 +381,16 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
                     volumeMounts=[{'name':'run','mountPath':'/run'},
                         {'name':'ipsec','mountPath':'/etc/swanctl/swanctl.conf','subPath':'swanctl.conf','readOnly':True}]))
                 if role=='provider':
+                    volumes.append({'name':'mqtt-auth','secret':{'secretName':'mqtt-auth'}})
+                    containers.append(self.container('mqtt',self.a.probe_image, command=['python','/probe/mqtt.py'],
+                        volumeMounts=[{'name':'probe','mountPath':'/probe','readOnly':True},
+                                      {'name':'mqtt-auth','mountPath':'/mqtt-auth','readOnly':True}]))
                     init.append(self.container('apn-alias',self.a.wg_image,['NET_ADMIN'],command=['ip','addr','add',APN+'/32','dev','lo']))
                 else:
                     containers.append(self.container('vici-exporter',self.a.exporter_image,
                         args=['--vici-network=unix','--vici-address=/run/charon.vici','--server-port=8079'],
                         volumeMounts=[{'name':'run','mountPath':'/run'}]))
-            if role=='dns':
+            if role.startswith('dns-'):
                 volumes.append({'name':'unbound','configMap':{'name':'unbound'}})
                 resolver=self.container('unbound',self.a.unbound_image,['NET_BIND_SERVICE'],
                     command=['/usr/sbin/unbound','-d','-c','/config/unbound.conf'],
@@ -354,6 +400,7 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
             pod = self.pod(role,node,containers,volumes,init)
             pod['metadata']['labels']['app']=role
             objects.append(pod)
+        self.proxy_resources(objects, cfg)
         self.apply(objects)
 
     def echo(self, role, target, proto='tcp', port=18080, expected=True, source=None):
@@ -411,7 +458,7 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
         return text
 
     def tests(self):
-        for role in ('provider','gateway','dns','support','support-client'):
+        for role in ('provider','gateway','dns-1','dns-2','support','support-client'):
             self.progress('startup: waiting '+role+' readiness')
             self.wait(lambda r=role:self.ready(r), role+' readiness')
         self.progress('startup: image startup IKE established; capturing WG sublink state')
@@ -438,15 +485,20 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
         assert http['source']==gwip, 'HTTP mock Internet source was not masqueraded'
         self.result['checks'].append({'name':'mock Internet HTTP source masqueraded','ok':True})
         for proto in ('tcp','udp'):
-            self.echo('dns',DNS[1],proto,18080)  # destination really has a listener
+            self.echo('dns-2',DNS[1],proto,18080)  # destination really has a listener
             self.check('denied DNS broker alias '+proto,lambda p=proto:self.echo('provider',DNS[1],p,18080,False))
         sas=self.exec('gateway','strongswan','swanctl','--list-sas')
         assert 'IKEv1' in sas and 'INSTALLED' in sas, 'IKEv1 CHILD SA not installed'
         self.check('exporter SA metrics',self.metrics)
-        logs=self.k('logs','-n',self.ns,'dns','-c','unbound')
-        assert APN in logs and 'allowed.example' in logs, 'Unbound did not observe APN source'
+        for name in ('dns-1','dns-2'):
+            logs=self.k('logs','-n',self.ns,name,'-c','unbound','--tail=200')
+            assert APN in logs and 'allowed.example' in logs, 'Unbound did not observe APN source'
+        self.check('real MQTT broker paths and source identity',self.mqtt_paths)
+        self.check('HAProxy master-worker reload preserves all held MQTT flows',self.proxy_reload)
+        self.check('one proxy replacement preserves other MQTT flows and IPsec',self.proxy_restart)
         self.check('datapath loss distinct from daemon liveness',self.health_failure)
         self.check('charon-only restart and exporter reconnect',self.restart)
+        self.check('bounded paced MQTT reconnect after APN recovery',self.mqtt_burst)
         # Read-only counters; never manipulate nft/XFRM outside the applications.
         for role in ('gateway','support'):
             self.result[role+'_nft']=json.loads(self.exec(role,'wg-link','nft','-j','list','table','inet','wg_link'))
@@ -525,7 +577,7 @@ secrets {{ ike-apn {{ id-1 = gateway.example\n id-2 = provider.example\n secret 
                 path.write_text(self.redact(text));os.chmod(path,0o600)
             except BaseException as e:
                 self.result.setdefault('diagnostic_errors',[]).append(prefix+'-'+role+'-'+label+': '+type(e).__name__)
-        for role in ('gateway','dns','support','support-client'):
+        for role in ('gateway','dns-1','dns-2','support','support-client'):
             for field in ('endpoints','allowed-ips','latest-handshakes','transfer'):
                 collect(role,'wg-link','wg-'+field,['wg','show','all',field])
             for label,cmd in [('addresses',['ip','-br','addr']),('routes',['ip','route','show','table','all']),
@@ -625,14 +677,19 @@ def arguments(argv=None):
     p.add_argument('--execute',action='store_true',help='explicitly permit Docker and Kubernetes execution')
     p.add_argument('--kubeconfig',required=True,help='explicit caller-owned kubeconfig; never inferred')
     p.add_argument('--nodes',nargs=3,required=True,metavar=('PROVIDER_NODE','GATEWAY_NODE','DNS_NODE'))
-    for name in ('wg','strongswan','unbound','exporter','probe'):
+    for name in ('wg','strongswan','unbound','exporter','probe','haproxy','broker'):
         p.add_argument('--'+name+'-image',required=True,help='immutable repository@sha256 digest')
     p.add_argument('--output',help='private evidence directory (no manifests or secret logs)')
     p.add_argument('--timeout',type=int,default=220)
+    p.add_argument('--connection-count',type=int,default=300,help='bounded concurrent MQTT clients, 3..1000')
+    p.add_argument('--connection-interval',type=float,default=0.02,help='seconds between handshake submissions, 0..1; zero is a bounded burst')
     a=p.parse_args(argv)
+    if not 3 <= a.connection_count <= 1000:p.error('--connection-count must be 3..1000')
+    if not 0 <= a.connection_interval <= 1:p.error('--connection-interval must be 0..1')
+    if a.connection_count*a.connection_interval+30 > a.timeout:p.error('--timeout must cover paced connections plus 30 seconds')
     if len(set(a.nodes))!=3:p.error('--nodes requires three distinct node names')
     if a.timeout<30:p.error('--timeout must be at least 30 seconds')
-    for key in ('wg_image','strongswan_image','unbound_image','exporter_image','probe_image'):
+    for key in ('wg_image','strongswan_image','unbound_image','exporter_image','probe_image','haproxy_image','broker_image'):
         if not re.fullmatch(r'[^\s@]+@sha256:[0-9a-f]{64}',getattr(a,key)):
             p.error('--'+key.replace('_','-')+' requires an immutable sha256 digest')
     return a

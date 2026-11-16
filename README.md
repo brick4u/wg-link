@@ -6,6 +6,8 @@ No CNI changes, node routes, CRDs, or central controller are required.
 
 See the [three-node test report and measured recovery times](docs/dev-acceptance-2026-11-02.md)
 and the [integrated IPSec, DNS, NAT and monitoring test](docs/system-acceptance-2026-11-03.md).
+The [broker-proxy acceptance](docs/proxy-acceptance-2026-11-16.md) adds source-preserving
+DNAT, separate HAProxy Pods and a 1,000-client MQTT reconnect test.
 
 ## Scope
 
@@ -389,3 +391,26 @@ after EndpointSlice/kernel-endpoint convergence. The latter includes Kubernetes
 command, scheduling and startup time. The test moves gateway Pods between
 running nodes.
 Complete latency evidence and successful cleanup are required for a passing run.
+
+### Integrated APN and broker-proxy acceptance
+
+The [system test](tests/system_acceptance.py) exercises IKEv1/NAT-T, two independent
+Unbound instances, support routing, Internet masquerade and three separate
+HAProxy + wg-link proxy Pods connected directly to authenticated VerneMQ backends.
+Devices keep their original broker destination IP and ports. Scoped DNAT routes
+them over WireGuard; HAProxy supplies the APN client address through PROXY v2.
+Backend connections use ordinary Kubernetes Service DNS names.
+
+The test requires an explicit kubeconfig, three distinct node names, immutable
+`--wg-image`, `--strongswan-image`, `--unbound-image`, `--exporter-image`,
+`--probe-image`, `--haproxy-image` and `--broker-image` digests, and `--execute`.
+Run `python3 tests/system_acceptance.py --help` for the full argument list.
+`--connection-count` selects 3–1000 concurrent authenticated MQTT clients;
+`--connection-interval 0` submits a bounded burst with at most 16 simultaneous
+handshakes. All resources are confined to an ownership-guarded temporary namespace.
+
+Checks include actual MQTT CONNECT/SUBSCRIBE/QoS1 publish-and-echo, broker-observed
+client IPs, sustained held connections during a standard HAProxy master-worker
+reload, proxy-Pod replacement isolated from other brokers and IPsec, and a
+reconnect burst after tunnel recovery. Only local IKE bootstrap publishes
+not-ready endpoints; WireGuard discovery selects a single ready proxy per broker.
