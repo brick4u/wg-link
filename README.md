@@ -349,6 +349,9 @@ these examples.
 
 ## Optional exclusive activation
 
+See the [three-gateway service and fault acceptance](docs/ha-acceptance-2026-11-17.md)
+for measured behavior and public IPsec composition results.
+
 A configuration may opt the entire interface group into Kubernetes Lease-based
 activation. Application health remains outside wg-link: kubelet readiness probes
 on named containers determine candidacy. Do not list the wg-link container itself
