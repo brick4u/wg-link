@@ -16,8 +16,9 @@ import (
 )
 
 type Config struct {
-	Interfaces []Interface `yaml:"interfaces"`
-	Forwarding *Forwarding `yaml:"forwarding"`
+	Interfaces []Interface       `yaml:"interfaces"`
+	Forwarding *Forwarding       `yaml:"forwarding"`
+	Activation *ActivationConfig `yaml:"activation"`
 }
 type Interface struct {
 	Name           string   `yaml:"name"`
@@ -33,6 +34,7 @@ type ServiceRef struct {
 	Namespace string `yaml:"namespace"`
 	Name      string `yaml:"name"`
 	Port      string `yaml:"port"`
+	LeaseName string `yaml:"leaseName"`
 }
 type Peer struct {
 	PublicKey           string      `yaml:"publicKey"`
@@ -135,6 +137,9 @@ func Load(path string) (*Config, error) {
 				}
 			}
 		}
+	}
+	if err := validateActivation(&c); err != nil {
+		return nil, err
 	}
 	if err := validateRouting(&c); err != nil {
 		return nil, err

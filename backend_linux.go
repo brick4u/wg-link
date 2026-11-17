@@ -184,6 +184,19 @@ func identityOfAddress(a netlink.Addr) (addressIdentity, bool) {
 	return id, true
 }
 
+// PrepareStandby installs route guards before removing owned WireGuard devices.
+// On a fresh standby, Apply(nil) alone cannot infer the protected prefixes.
+func (b *LinuxBackend) PrepareStandby(c *Config) error {
+	for _, n := range c.Interfaces {
+		for _, prefix := range n.Routes {
+			if err := ensureRoute(routeFor(prefix, true, 0)); err != nil {
+				return fmt.Errorf("install standby route guard: %w", err)
+			}
+		}
+	}
+	return b.Apply(nil)
+}
+
 func (b *LinuxBackend) Apply(desired []DesiredInterface) error {
 	// Install persistent guards before touching peers or interfaces. Tombstones intentionally survive config removal.
 	for _, d := range desired {

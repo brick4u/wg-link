@@ -14,7 +14,7 @@ func TestCredentialFailureStillProtectsRoutes(t *testing.T) {
 	b := &fakeBackend{}
 	a := &Agent{Backend: b, Prepare: func(*Config) error { return errors.New("credentials unavailable") }}
 	c := loadedConfig(t)
-	c.Interfaces[0].Peers[0].Service = &ServiceRef{"ns", "peer", "wg"}
+	c.Interfaces[0].Peers[0].Service = &ServiceRef{Namespace: "ns", Name: "peer", Port: "wg"}
 	if a.Reconcile(c) == nil {
 		t.Fatal("expected discovery setup failure")
 	}
@@ -90,7 +90,7 @@ func TestEndpointChangesAndRoaming(t *testing.T) {
 	r := &fakeResolver{"10.0.0.2:51820", "ready"}
 	a := &Agent{Backend: b, Discovery: r}
 	c := loadedConfig(t)
-	c.Interfaces[0].Peers[0].Service = &ServiceRef{"ns", "peer", "wg"}
+	c.Interfaces[0].Peers[0].Service = &ServiceRef{Namespace: "ns", Name: "peer", Port: "wg"}
 	for i := 0; i < 2; i++ {
 		if e := a.Reconcile(c); e != nil {
 			t.Fatal(e)

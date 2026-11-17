@@ -14,16 +14,25 @@ import (
 type Resolver interface {
 	Resolve(ServiceRef) (*net.UDPAddr, string)
 }
+type ActivationControl interface {
+	Selected() bool
+	Ready() bool
+	SetConfigured(bool)
+	ReconcileGuard(context.Context) error
+}
+
 type Agent struct {
-	Backend     Backend
-	Discovery   Resolver
-	Prepare     func(*Config) error
-	mu          sync.Mutex
-	ready       bool
-	failures    uint64
-	successes   uint64
-	lastSuccess time.Time
-	states      map[string]int
+	Activation      ActivationControl
+	Backend         Backend
+	Discovery       Resolver
+	Prepare         func(*Config) error
+	ValidateRuntime func(*Config) error
+	mu              sync.Mutex
+	ready           bool
+	failures        uint64
+	successes       uint64
+	lastSuccess     time.Time
+	states          map[string]int
 	// Only changes in declared discovery/static endpoint overwrite authenticated roaming.
 	endpoints map[string]string
 }
@@ -31,6 +40,49 @@ type Agent struct {
 func (a *Agent) Reconcile(c *Config) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if c.Activation != nil && a.Activation == nil {
+		a.ready = false
+		return fmt.Errorf("activation configured without an activation controller")
+	}
+	if a.Activation != nil {
+		defer func() {
+			if !a.ready {
+				a.Activation.SetConfigured(false)
+				_ = a.Activation.ReconcileGuard(context.Background())
+			}
+		}()
+		if a.ValidateRuntime != nil {
+			if err := a.ValidateRuntime(c); err != nil {
+				a.ready = false
+				return err
+			}
+		}
+		if c.Activation == nil {
+			a.Activation.SetConfigured(false)
+			_ = a.Activation.ReconcileGuard(context.Background())
+			a.ready = false
+			return fmt.Errorf("activation cannot be removed without restarting the process")
+		}
+		if !a.Activation.Selected() {
+			a.Activation.SetConfigured(false)
+			// Confirm a closed kernel gate before removing standby interfaces.
+			if err := a.Activation.ReconcileGuard(context.Background()); err != nil {
+				a.ready = false
+				return err
+			}
+			if backend, ok := a.Backend.(interface{ PrepareStandby(*Config) error }); ok {
+				if err := backend.PrepareStandby(c); err != nil {
+					a.ready = false
+					return err
+				}
+			} else {
+				a.ready = false
+				return fmt.Errorf("backend does not support safe standby preparation")
+			}
+			a.ready = false
+			return nil
+		}
+	}
 	if err := validateRouting(c); err != nil {
 		a.failures++
 		a.ready = false
@@ -108,19 +160,37 @@ func (a *Agent) Reconcile(c *Config) error {
 			return err
 		}
 	}
-	a.ready = true
+	if a.Activation != nil {
+		a.Activation.SetConfigured(true)
+		if err := a.Activation.ReconcileGuard(context.Background()); err != nil {
+			a.ready = false
+			return err
+		}
+		a.ready = a.Activation.Ready()
+	} else {
+		a.ready = true
+	}
 	a.successes++
 	a.lastSuccess = time.Now()
 	return nil
 }
-func (a *Agent) ReloadFailure() { a.mu.Lock(); defer a.mu.Unlock(); a.failures++; a.ready = false }
+func (a *Agent) ReloadFailure() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.failures++
+	a.ready = false
+	if a.Activation != nil {
+		a.Activation.SetConfigured(false)
+		_ = a.Activation.ReconcileGuard(context.Background())
+	}
+}
 func (a *Agent) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.Lock()
 		defer a.mu.Unlock()
-		if !a.ready {
+		if !a.ready || (a.Activation != nil && !a.Activation.Ready()) {
 			http.Error(w, "not ready", 503)
 			return
 		}
@@ -131,6 +201,16 @@ func (a *Agent) Handler() http.Handler {
 		defer a.mu.Unlock()
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		fmt.Fprintf(w, "wg_link_reconcile_errors_total %d\nwg_link_reconcile_success_total %d\nwg_link_last_success_timestamp_seconds %d\n", a.failures, a.successes, a.lastSuccess.Unix())
+		if a.Activation != nil {
+			selected, ready := 0, 0
+			if a.Activation.Selected() {
+				selected = 1
+			}
+			if a.Activation.Ready() {
+				ready = 1
+			}
+			fmt.Fprintf(w, "wg_link_activation_selected %d\nwg_link_activation_ready %d\n", selected, ready)
+		}
 		for _, state := range []string{"ready", "missing", "ambiguous", "static", "learned"} {
 			fmt.Fprintf(w, "wg_link_endpoints{state=%q} %d\n", state, a.states[state])
 		}

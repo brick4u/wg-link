@@ -347,6 +347,59 @@ key reload, MTU, and negative leak tests require validation in your environment.
 No production deployment or end-to-end connectivity guarantee is implied by
 these examples.
 
+## Optional exclusive activation
+
+A configuration may opt the entire interface group into Kubernetes Lease-based
+activation. Application health remains outside wg-link: kubelet readiness probes
+on named containers determine candidacy. Do not list the wg-link container itself
+or depend on Pod Ready, which includes wg-link's own activation readiness.
+
+```yaml
+activation:
+  kubernetesLease:
+    name: gateway-active
+    requireReadyContainers: [application]
+    leaseDuration: 15s
+    renewDeadline: 10s
+    retryPeriod: 1s
+  fenceTimeout: 3s
+```
+
+Supply `POD_NAME`, `POD_NAMESPACE`, `POD_UID` through the Downward API and set
+`WG_CONTAINER_NAME` to this container's name. The application must run in an
+ordinary Pod network namespace, not hostNetwork. Fixed, unique positive
+WireGuard listen ports are required; activation settings and the listen-port set
+are restart-required. Readiness is successful only after an eligible holder has
+configured its interfaces and opened the kernel gate. Standbys retain protected
+blackhole routes but remove owned WireGuard interfaces.
+
+The namespace Role requires Pod `get` and Lease `get/list/watch/create/update`.
+No provider credentials or application-specific APIs are used. A Service peer can
+optionally set `leaseName: gateway-active`; discovery filters ready EndpointSlice
+Pod UIDs to the current Lease holder. Without `leaseName`, no Lease permission is
+required and existing discovery behavior is retained. Missing or ambiguous
+selection keeps an existing authenticated endpoint, without routing fallback.
+
+A separate owned nftables table fences only the managed UDP INPUT destination
+and OUTPUT source ports. Opening requires an absolute wall-clock deadline and a
+relative kernel timeout. Kernel expiry still applies if userspace stops running.
+Late owned-Lease acknowledgements are bounded by request start time; confirmed
+fence closure precedes early ownership release. Other protocols and ports are
+not gated. Lease election is not itself a fencing guarantee: combined clock
+rewind and delayed stale execution remain a bounded-clock/fault assumption.
+
+Failed Pod GETs retain the last successful eligibility observation only within
+`renewDeadline`; they do not immediately demote a healthy owner. The gate never
+extends beyond that observation budget or the latest acknowledged Lease-write
+budget. With the defaults, complete API loss therefore closes within about ten
+seconds; a stalled process loses its kernel allowance within three seconds.
+An explicit successful observation of an unready required container closes
+immediately. Container Ready is the last kubelet-reported result, not a
+timestamped application heartbeat. Readiness-probe targets and thresholds
+remain the deployment's responsibility. The optional mode requires Linux,
+NET_ADMIN, nftables and namespace-scoped Kubernetes access; legacy mode does not
+acquire a Lease or require Pod lookup.
+
 ## Development and tests
 
 ```sh
@@ -414,3 +467,19 @@ client IPs, sustained held connections during a standard HAProxy master-worker
 reload, proxy-Pod replacement isolated from other brokers and IPsec, and a
 reconnect burst after tunnel recovery. Only local IKE bootstrap publishes
 not-ready endpoints; WireGuard discovery selects a single ready proxy per broker.
+
+### Public IPvlan and IPsec failover acceptance
+
+The [IPvlan test](tests/ipvlan_acceptance.py) first checks the normal Flannel path,
+then a secondary public `/32` with source routing and external UDP/TCP replies.
+The [IPsec test](tests/ipvlan_ipsec_acceptance.py) adds native ESP or forced
+ESP-in-UDP, cold initiation from either end, hard test-Floating-IP moves,
+protected traffic observations, rekey, reauthentication and Pod recreation.
+See the [measured results and limitations](docs/ipvlan-ipsec-acceptance-2026-11-17.md).
+
+Both tools require explicit environment arguments and `--execute`. The IPsec
+tool additionally requires mutation acknowledgements and a private approval file.
+Its host-network test peer has an independently armed, process-qualified recovery
+helper and exact benchmark selectors. Use dedicated test resources, never
+production VPN credentials or a production Floating IP. Run each tool with
+`--help` and review the safety requirements before execution.
