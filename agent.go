@@ -37,7 +37,7 @@ type Agent struct {
 	endpoints map[string]string
 }
 
-func (a *Agent) Reconcile(c *Config) error {
+func (a *Agent) Reconcile(c *Config) (reconcileErr error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if c.Activation != nil && a.Activation == nil {
@@ -45,7 +45,13 @@ func (a *Agent) Reconcile(c *Config) error {
 		return fmt.Errorf("activation configured without an activation controller")
 	}
 	if a.Activation != nil {
+		selectedAttempt := a.Activation.Selected()
 		defer func() {
+			if reconcileErr != nil && selectedAttempt {
+				if control, ok := a.Activation.(interface{ ConfigurationFailed() }); ok {
+					control.ConfigurationFailed()
+				}
+			}
 			if !a.ready {
 				a.Activation.SetConfigured(false)
 				_ = a.Activation.ReconcileGuard(context.Background())
@@ -180,6 +186,11 @@ func (a *Agent) ReloadFailure() {
 	a.failures++
 	a.ready = false
 	if a.Activation != nil {
+		if a.Activation.Selected() {
+			if control, ok := a.Activation.(interface{ ConfigurationFailed() }); ok {
+				control.ConfigurationFailed()
+			}
+		}
 		a.Activation.SetConfigured(false)
 		_ = a.Activation.ReconcileGuard(context.Background())
 	}

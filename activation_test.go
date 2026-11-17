@@ -107,6 +107,43 @@ func TestActivationReadyRequiresConfiguredFreshAuthority(t *testing.T) {
 		t.Fatal("stale authority not fenced/reset")
 	}
 }
+func TestActivationConfigurationFailureYieldsWithCooldown(t *testing.T) {
+	a, client, f, _ := activationFixture(t)
+	a.candidate = true
+	a.observed = time.Now()
+	a.ack = time.Now()
+	a.leading = true
+	a.configured = true
+	if err := a.ReconcileGuard(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	notified := false
+	a.notify = func() { notified = true }
+	cancelled := false
+	a.cancelElection = func() { cancelled = true }
+	generation := a.generation
+	a.ConfigurationFailed()
+	if a.Eligible() || a.Selected() || a.Ready() || a.configured || !cancelled || !notified || a.generation == generation {
+		t.Fatal("configuration failure did not yield ownership")
+	}
+	if err := a.poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !a.candidate || a.Eligible() || f.isOpen() {
+		t.Fatal("healthy observation bypassed cooldown or was lost")
+	}
+	lock := &activationLeaseLock{Interface: &resourcelock.LeaseLock{LeaseMeta: metav1.ObjectMeta{Namespace: "test", Name: "group"}, Client: client.CoordinationV1(), LockConfig: resourcelock.ResourceLockConfig{Identity: "uid"}}, activation: a}
+	if err := lock.Create(context.Background(), resourcelock.LeaderElectionRecord{HolderIdentity: "uid", LeaseDurationSeconds: 15}); err == nil {
+		t.Fatal("reacquired during configuration failure cooldown")
+	}
+	a.mu.Lock()
+	a.retryNotBefore = time.Now().Add(-time.Second)
+	a.mu.Unlock()
+	if !a.Eligible() || a.Selected() || a.Ready() {
+		t.Fatal("cooldown recovery must permit competition, not restore old authority")
+	}
+}
+
 func TestActivationSubsecondDeadlineDemotesNormally(t *testing.T) {
 	a, _, f, _ := activationFixture(t)
 	now := time.Now()

@@ -2,6 +2,7 @@ package wglink
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -45,8 +46,10 @@ func TestActivationConfigRejectsUnsafePortsAndDurations(t *testing.T) {
 type fakeActivation struct {
 	selected, configured, ready bool
 	closed                      int
+	failed                      int
 }
 
+func (f *fakeActivation) ConfigurationFailed() { f.failed++; f.selected = false; f.configured = false }
 func (f *fakeActivation) Selected() bool       { return f.selected }
 func (f *fakeActivation) Ready() bool          { return f.ready && f.configured && f.selected }
 func (f *fakeActivation) SetConfigured(v bool) { f.configured = v }
@@ -113,6 +116,17 @@ func TestActivationPortReloadRejectedBeforeBackendMutation(t *testing.T) {
 	}
 	if ValidateActivationReload(initial, initial) != nil {
 		t.Fatal("identical config rejected")
+	}
+}
+
+func TestSelectedBackendFailureYieldsActivation(t *testing.T) {
+	c := loadedConfig(t)
+	c.Activation = &ActivationConfig{KubernetesLease: KubernetesLeaseConfig{Name: "active"}}
+	gate := &fakeActivation{selected: true, ready: true}
+	b := &standbyBackend{fakeBackend: fakeBackend{err: errors.New("kernel apply failure")}}
+	a := &Agent{Backend: b, Activation: gate}
+	if a.Reconcile(c) == nil || gate.failed != 1 || gate.selected || gate.configured || status(a, "/readyz") != 503 {
+		t.Fatal("broken holder retained authority")
 	}
 }
 

@@ -35,6 +35,7 @@ type Activation struct {
 	notify                       func()
 	candidate                    bool
 	observed, ack, allowed       time.Time
+	retryNotBefore               time.Time
 	generation                   uint64
 	leading, configured, running bool
 	cancelElection               context.CancelFunc
@@ -78,7 +79,7 @@ func (a *Activation) signal() {
 	}
 }
 func (a *Activation) eligibleLocked(now time.Time) bool {
-	return a.candidate && now.Before(a.observed.Add(a.config.KubernetesLease.RenewDeadline))
+	return a.candidate && !now.Before(a.retryNotBefore) && now.Before(a.observed.Add(a.config.KubernetesLease.RenewDeadline))
 }
 func (a *Activation) selectedLocked(now time.Time) bool {
 	return a.leading && a.eligibleLocked(now) && !a.ack.IsZero() && now.Before(a.ack.Add(a.config.KubernetesLease.RenewDeadline))
@@ -100,6 +101,18 @@ func (a *Activation) Ready() bool {
 	return a.configured && a.selectedLocked(now) && now.Before(a.allowed)
 }
 func (a *Activation) SetConfigured(v bool) { a.mu.Lock(); a.configured = v; a.mu.Unlock() }
+
+// ConfigurationFailed yields ownership when the selected interface group cannot
+// be applied. It prevents renewed competition for RenewDeadline so another
+// healthy candidate can serve. Run confirms fencing before releasing the lease;
+// callers needing synchronous closure must also call ReconcileGuard.
+func (a *Activation) ConfigurationFailed() {
+	a.mu.Lock()
+	a.retryNotBefore = time.Now().Add(a.config.KubernetesLease.RenewDeadline)
+	a.invalidateLocked()
+	a.mu.Unlock()
+	a.signal()
+}
 
 // ReconcileGuard serializes all gate writes with leadership invalidation. It
 // computes deadlines before kernel I/O, so delayed responses cannot extend them.
@@ -178,7 +191,6 @@ func (a *Activation) poll(ctx context.Context) error {
 	}
 	var fenceErr error
 	if !a.eligibleLocked(time.Now()) {
-		a.candidate = false
 		a.invalidateLocked()
 		fenceErr = a.fence.Close(ctx)
 	}

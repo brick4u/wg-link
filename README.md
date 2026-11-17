@@ -371,7 +371,9 @@ ordinary Pod network namespace, not hostNetwork. Fixed, unique positive
 WireGuard listen ports are required; activation settings and the listen-port set
 are restart-required. Readiness is successful only after an eligible holder has
 configured its interfaces and opened the kernel gate. Standbys retain protected
-blackhole routes but remove owned WireGuard interfaces.
+blackhole routes but remove owned WireGuard interfaces. A selected instance that
+cannot apply its interface configuration yields ownership and waits one renewal
+deadline before competing again, so it cannot indefinitely block healthy peers.
 
 The namespace Role requires Pod `get` and Lease `get/list/watch/create/update`.
 No provider credentials or application-specific APIs are used. A Service peer can
