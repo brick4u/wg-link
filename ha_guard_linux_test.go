@@ -70,6 +70,9 @@ func TestHAGuardClosedOpenClose(t *testing.T) {
 	if strings.Contains(closed, "active_ports") || strings.Contains(closed, "delete table") || !g.Deadline().IsZero() {
 		t.Fatal("initial install was not closed")
 	}
+	if err := g.Close(ctx); err != nil || len(batches) != 1 {
+		t.Fatalf("acknowledged standby Close invoked nft: error %v, batches %d", err, len(batches))
+	}
 	d := time.Now().Add(10 * time.Second)
 	if err := g.AllowUntil(ctx, d, time.Now().Add(-time.Second)); err != nil {
 		t.Fatal(err)
@@ -88,6 +91,9 @@ func TestHAGuardClosedOpenClose(t *testing.T) {
 	}
 	if strings.Contains(batches[2], "active_ports") || !g.Deadline().IsZero() {
 		t.Fatal("close retained an allowance")
+	}
+	if err := g.Close(ctx); err != nil || len(batches) != 3 {
+		t.Fatalf("acknowledged active Close invoked nft again: error %v, batches %d", err, len(batches))
 	}
 }
 
@@ -152,9 +158,76 @@ func TestHAGuardNftFailureKeepsAcknowledgedState(t *testing.T) {
 	}
 }
 
+func TestHAGuardAmbiguousAllowForcesClose(t *testing.T) {
+	g, _ := NewHAGuard([]int{51820})
+	g.installed = true
+	var batches []string
+	failNext := true
+	g.run = func(_ context.Context, input string, args ...string) ([]byte, error) {
+		if fmt.Sprint(args) == "[-j list table inet wg_link_ha]" {
+			return []byte(`{"nftables":[{"table":{"family":"inet","name":"wg_link_ha","comment":"wg-link:ha:v1"}},{"set":{"name":"managed_ports","elem":[51820]}}]}`), nil
+		}
+		if fmt.Sprint(args) == "[-j list tables]" {
+			return []byte(`{"nftables":[{"table":{"family":"inet","name":"wg_link_ha"}}]}`), nil
+		}
+		if fmt.Sprint(args) != "[-f -]" {
+			t.Fatalf("unexpected nft args: %v", args)
+		}
+		batches = append(batches, input)
+		if failNext {
+			failNext = false
+			return nil, errors.New("kernel may have accepted open; ACK lost")
+		}
+		return nil, nil
+	}
+	if err := g.AllowUntil(context.Background(), time.Now().Add(10*time.Second), time.Now()); err == nil || !g.uncertain || !g.deadline.IsZero() {
+		t.Fatal("ambiguous allow must retain previous deadline and mark state uncertain")
+	}
+	if err := g.Close(context.Background()); err != nil || len(batches) != 2 || !g.deadline.IsZero() || g.uncertain {
+		t.Fatalf("ambiguous allow skipped mandatory close: err=%v batches=%d uncertain=%v", err, len(batches), g.uncertain)
+	}
+	if strings.Contains(batches[1], "active_ports") {
+		t.Fatal("recovery Close did not install deny-only rules")
+	}
+	if err := g.Close(context.Background()); err != nil || len(batches) != 2 {
+		t.Fatalf("recovered close not idempotent: err=%v batches=%d", err, len(batches))
+	}
+}
+
+func TestHAGuardFailedCloseRetries(t *testing.T) {
+	g, _ := NewHAGuard([]int{51820})
+	g.installed = true
+	g.deadline = time.Now().Add(10 * time.Second)
+	attempts := 0
+	g.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if fmt.Sprint(args) == "[-j list table inet wg_link_ha]" {
+			return []byte(`{"nftables":[{"table":{"family":"inet","name":"wg_link_ha","comment":"wg-link:ha:v1"}},{"set":{"name":"managed_ports","elem":[51820]}}]}`), nil
+		}
+		if fmt.Sprint(args) == "[-j list tables]" {
+			return []byte(`{"nftables":[{"table":{"family":"inet","name":"wg_link_ha"}}]}`), nil
+		}
+		attempts++
+		if attempts == 1 {
+			return nil, errors.New("close ACK lost")
+		}
+		return nil, nil
+	}
+	ctx := context.Background()
+	if err := g.Close(ctx); err == nil || !g.uncertain || attempts != 1 {
+		t.Fatalf("failed close not uncertain: err=%v attempts=%d", err, attempts)
+	}
+	if err := g.Close(ctx); err != nil || g.uncertain || !g.deadline.IsZero() || attempts != 2 {
+		t.Fatalf("close did not retry: err=%v attempts=%d", err, attempts)
+	}
+	if err := g.Close(ctx); err != nil || attempts != 2 {
+		t.Fatalf("acknowledged close repeated: err=%v attempts=%d", err, attempts)
+	}
+}
+
 func TestHAGuardConcurrentUpdatesSerialize(t *testing.T) {
 	g, _ := NewHAGuard([]int{51820})
 	g.installed = true
+	g.deadline = time.Now().Add(10 * time.Second)
 	var wg sync.WaitGroup
 	active := make(chan struct{}, 1)
 	g.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {

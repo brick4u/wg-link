@@ -29,6 +29,7 @@ type HAGuard struct {
 	window    time.Duration
 	run       nftRunner
 	installed bool
+	uncertain bool // A write may have reached the kernel without an acknowledgement.
 	deadline  time.Time
 }
 
@@ -64,6 +65,9 @@ func NewHAGuardWithTimeout(ports []int, timeout time.Duration) (*HAGuard, error)
 func (g *HAGuard) InstallClosed(ctx context.Context) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	// Always revalidate and write on startup, even if this process previously
+	// observed a closed state: a retained namespace may contain old rules.
+	g.uncertain = true
 	if err := g.checkTable(ctx); err != nil {
 		return err
 	}
@@ -72,6 +76,7 @@ func (g *HAGuard) InstallClosed(ctx context.Context) error {
 	}
 	g.installed = true
 	g.deadline = time.Time{}
+	g.uncertain = false
 	return nil
 }
 
@@ -105,10 +110,14 @@ func (g *HAGuard) AllowUntil(ctx context.Context, absoluteDeadline, refreshStart
 	if milliseconds < 1 {
 		return fmt.Errorf("HA monotonic timeout already expired")
 	}
+	// An error can mean the kernel accepted a transaction but its ACK was
+	// lost. A later Close must never trust the previously cached deadline.
+	g.uncertain = true
 	if err := g.install(ctx, absoluteDeadline, milliseconds); err != nil {
 		return err
 	}
 	g.deadline = absoluteDeadline
+	g.uncertain = false
 	return nil
 }
 
@@ -120,10 +129,15 @@ func (g *HAGuard) Close(ctx context.Context) error {
 	if !g.installed {
 		return fmt.Errorf("HA guard is not installed")
 	}
+	if g.deadline.IsZero() && !g.uncertain {
+		return nil // Closed, acknowledged, and unchanged by this guard.
+	}
+	g.uncertain = true
 	if err := g.install(ctx, time.Time{}, 0); err != nil {
 		return err
 	}
 	g.deadline = time.Time{}
+	g.uncertain = false
 	return nil
 }
 

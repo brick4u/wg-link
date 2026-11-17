@@ -384,8 +384,10 @@ A separate owned nftables table fences only the managed UDP INPUT destination
 and OUTPUT source ports. Opening requires an absolute wall-clock deadline and a
 relative kernel timeout. Kernel expiry still applies if userspace stops running.
 Late owned-Lease acknowledgements are bounded by request start time; confirmed
-fence closure precedes early ownership release. Other protocols and ports are
-not gated. Lease election is not itself a fencing guarantee: combined clock
+fence closure precedes early ownership release. A previously acknowledged closed
+gate is reused without repeated nft writes; uncertain write outcomes always force
+another close attempt. External modification of this owned table is unsupported.
+Other protocols and ports are not gated. Lease election is not itself a fencing guarantee: combined clock
 rewind and delayed stale execution remain a bounded-clock/fault assumption.
 
 Failed Pod GETs retain the last successful eligibility observation only within
